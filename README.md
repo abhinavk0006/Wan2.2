@@ -1,4 +1,16 @@
-# Wan2.2
+# Wan2.2 (Memory Optimized Fork)
+
+This fork contains custom memory optimizations designed to run Wan 2.2 models (including the **14B Image-to-Video** model) in RAM-constrained environments (e.g., 62GB CPU RAM / 46GB L40S GPU VRAM) without out-of-memory (OOM) crashes.
+
+## 🛠️ Memory Optimizations Added
+
+1. **Lazy Weights Loading**: Rather than loading the heavy T5, VAE, and expert diffusion models (`high_noise` and `low_noise`) into memory all at once during startup, components are loaded lazily:
+   - T5 and VAE are loaded at initialization.
+   - The DiT weights (`high_noise_model` / `low_noise_model`) are only loaded from disk when execution reaches their respective denoising step ranges.
+2. **GPU-to-CPU Memory Unloading Sequence**: When transitioning experts at denoising step 15, the active GPU expert is first explicitly offloaded to the CPU (`.to('cpu')`), and its CPU reference is set to `None` with `gc.collect()` before the next expert is loaded. This prevents overlapping memory spikes on both the GPU VRAM and CPU RAM, keeping physical RAM usage under 52GB at all times.
+3. **JSON-RPC Daemon Support**: Added a persistent daemon mode via `--daemon` which handles generation requests over standard input/output. This avoids model load/unload overhead between sequential video clips.
+
+---
 
 <p align="center">
     <img src="assets/logo.png" width="400"/>
