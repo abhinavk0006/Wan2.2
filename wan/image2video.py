@@ -100,24 +100,14 @@ class WanI2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
-        self.low_noise_model = self._configure_model(
-            model=self.low_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        self.checkpoint_dir = checkpoint_dir
+        self.use_sp = use_sp
+        self.dit_fsdp = dit_fsdp
+        self.shard_fn = shard_fn
+        self.convert_model_dtype = convert_model_dtype
 
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
-        self.high_noise_model = self._configure_model(
-            model=self.high_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        self.low_noise_model = None
+        self.high_noise_model = None
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -166,6 +156,8 @@ class WanI2V:
                 model.to(self.param_dtype)
             if not self.init_on_cpu:
                 model.to(self.device)
+            else:
+                model.to("cpu")
 
         return model
 
@@ -189,18 +181,48 @@ class WanI2V:
         if t.item() >= boundary:
             required_model_name = 'high_noise_model'
             offload_model_name = 'low_noise_model'
+            subfolder = self.config.high_noise_checkpoint
         else:
             required_model_name = 'low_noise_model'
             offload_model_name = 'high_noise_model'
+            subfolder = self.config.low_noise_checkpoint
+
+        # Lazy load the required model if not loaded yet
+        if getattr(self, required_model_name) is None:
+            # Unload the other model first to prevent CPU memory spike/swapping
+            other_model_obj = getattr(self, offload_model_name)
+            if other_model_obj is not None:
+                if next(other_model_obj.parameters()).device.type == 'cuda':
+                    logging.info(f"Offloading {offload_model_name} to CPU before unloading")
+                    other_model_obj.to('cpu')
+                logging.info(f"Unloading {offload_model_name} from memory to free CPU RAM")
+                setattr(self, offload_model_name, None)
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            logging.info(f"Lazy loading {required_model_name} from {subfolder}")
+            model = WanModel.from_pretrained(
+                self.checkpoint_dir, subfolder=subfolder, low_cpu_mem_usage=True)
+            model = self._configure_model(
+                model=model,
+                use_sp=self.use_sp,
+                dit_fsdp=self.dit_fsdp,
+                shard_fn=self.shard_fn,
+                convert_model_dtype=self.convert_model_dtype)
+            setattr(self, required_model_name, model)
+
         if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
-                getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
-                getattr(self, required_model_name).to(self.device)
+            offload_model_obj = getattr(self, offload_model_name)
+            if offload_model_obj is not None:
+                if next(offload_model_obj.parameters()).device.type == 'cuda':
+                    offload_model_obj.to('cpu')
+            
+            required_model_obj = getattr(self, required_model_name)
+            if next(required_model_obj.parameters()).device.type == 'cpu':
+                required_model_obj.to(self.device)
+
         return getattr(self, required_model_name)
 
     def generate(self,

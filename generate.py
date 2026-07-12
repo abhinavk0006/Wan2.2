@@ -77,7 +77,8 @@ def _validate_args(args):
         args.tts_text = EXAMPLE_PROMPT[args.task]["tts_text"]
 
     if args.task == "i2v-A14B":
-        assert args.image is not None, "Please specify the image path for i2v."
+        if not getattr(args, "daemon", False):
+            assert args.image is not None, "Please specify the image path for i2v."
 
     cfg = WAN_CONFIGS[args.task]
 
@@ -221,6 +222,16 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
+    parser.add_argument(
+        "--n_prompt",
+        type=str,
+        default="",
+        help="Negative prompt for the generated video.")
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        default=False,
+        help="Run in daemon mode, reading generation tasks from stdin.")
 
     # animate
     parser.add_argument(
@@ -300,14 +311,14 @@ def _parse_args():
     return args
 
 
-def _init_logging(rank):
+def _init_logging(rank, daemon=False):
     # logging
     if rank == 0:
         # set format
         logging.basicConfig(
             level=logging.INFO,
             format="[%(asctime)s] %(levelname)s: %(message)s",
-            handlers=[logging.StreamHandler(stream=sys.stdout)])
+            handlers=[logging.StreamHandler(stream=sys.stderr if daemon else sys.stdout)])
     else:
         logging.basicConfig(level=logging.ERROR)
 
@@ -317,7 +328,7 @@ def generate(args):
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = local_rank
-    _init_logging(rank)
+    _init_logging(rank, getattr(args, "daemon", False))
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
@@ -424,7 +435,8 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model,
+            n_prompt=args.n_prompt)
     elif "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
         wan_ti2v = wan.WanTI2V(
@@ -451,7 +463,8 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model,
+            n_prompt=args.n_prompt)
     elif "animate" in args.task:
         logging.info("Creating Wan-Animate pipeline.")
         wan_animate = wan.WanAnimate(
@@ -478,7 +491,8 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model,
+            n_prompt=args.n_prompt)
     elif "s2v" in args.task:
         logging.info("Creating WanS2V pipeline.")
         wan_s2v = wan.WanS2V(
@@ -512,6 +526,7 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model,
             init_first_frame=args.start_from_ref,
+            n_prompt=args.n_prompt,
         )
     else:
         logging.info("Creating WanI2V pipeline.")
@@ -526,6 +541,175 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+    
+    if getattr(args, "daemon", False):
+        import json
+        if rank == 0:
+            sys.stdout.write("READY\n")
+            sys.stdout.flush()
+        
+        while True:
+            if rank == 0:
+                line = sys.stdin.readline()
+                if not line:
+                    task = {"action": "exit"}
+                else:
+                    try:
+                        task = json.loads(line.strip())
+                    except Exception as e:
+                        task = {"action": "error", "error": f"Invalid JSON: {str(e)}"}
+            else:
+                task = None
+            
+            if dist.is_initialized():
+                task_list = [task]
+                dist.broadcast_object_list(task_list, src=0)
+                task = task_list[0]
+            
+            if task.get("action") == "exit":
+                break
+                
+            if task.get("action") == "error":
+                if rank == 0:
+                    sys.stdout.write(json.dumps({"status": "error", "error": task["error"]}) + "\n")
+                    sys.stdout.flush()
+                continue
+            
+            prompt = task.get("prompt", args.prompt)
+            image_path = task.get("input_image", args.image)
+            save_file = task.get("output_video", args.save_file)
+            seed = task.get("seed", args.base_seed)
+            if seed < 0:
+                seed = random.randint(0, sys.maxsize)
+            
+            # Calculate frame_num dynamically from clip_duration if provided
+            clip_duration = task.get("clip_duration")
+            if clip_duration is not None:
+                try:
+                    raw_frames = float(clip_duration) * cfg.sample_fps
+                    n = round((raw_frames - 1) / 4)
+                    if n < 1:
+                        n = 1
+                    frame_num = 4 * n + 1
+                except Exception:
+                    frame_num = args.frame_num
+            else:
+                frame_num = args.frame_num
+                
+            try:
+                img = None
+                if image_path:
+                    img = Image.open(image_path).convert("RGB")
+                    
+                if "t2v" in args.task:
+                    video = wan_t2v.generate(
+                        prompt,
+                        size=SIZE_CONFIGS[args.size],
+                        frame_num=frame_num,
+                        shift=args.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sample_steps,
+                        guide_scale=args.sample_guide_scale,
+                        seed=seed,
+                        offload_model=args.offload_model
+                    )
+                elif "ti2v" in args.task:
+                    video = wan_ti2v.generate(
+                        prompt,
+                        img=img,
+                        size=SIZE_CONFIGS[args.size],
+                        max_area=MAX_AREA_CONFIGS[args.size],
+                        frame_num=frame_num,
+                        shift=args.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sample_steps,
+                        guide_scale=args.sample_guide_scale,
+                        seed=seed,
+                        offload_model=args.offload_model
+                    )
+                elif "animate" in args.task:
+                    video = wan_animate.generate(
+                        src_root_path=task.get("src_root_path", args.src_root_path),
+                        replace_flag=task.get("replace_flag", args.replace_flag),
+                        refert_num=task.get("refert_num", args.refert_num),
+                        clip_len=frame_num,
+                        shift=args.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sample_steps,
+                        guide_scale=args.sample_guide_scale,
+                        seed=seed,
+                        offload_model=args.offload_model
+                    )
+                elif "s2v" in args.task:
+                    video = wan_s2v.generate(
+                        input_prompt=prompt,
+                        ref_image_path=image_path,
+                        audio_path=task.get("audio", args.audio),
+                        enable_tts=task.get("enable_tts", args.enable_tts),
+                        tts_prompt_audio=task.get("tts_prompt_audio", args.tts_prompt_audio),
+                        tts_prompt_text=task.get("tts_prompt_text", args.tts_prompt_text),
+                        tts_text=task.get("tts_text", args.tts_text),
+                        num_repeat=task.get("num_clip", args.num_clip),
+                        pose_video=task.get("pose_video", args.pose_video),
+                        max_area=MAX_AREA_CONFIGS[args.size],
+                        infer_frames=task.get("infer_frames", args.infer_frames),
+                        shift=args.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sample_steps,
+                        guide_scale=args.sample_guide_scale,
+                        seed=seed,
+                        offload_model=args.offload_model,
+                        init_first_frame=task.get("start_from_ref", args.start_from_ref),
+                    )
+                else:
+                    video = wan_i2v.generate(
+                        prompt,
+                        img,
+                        max_area=MAX_AREA_CONFIGS[args.size],
+                        frame_num=frame_num,
+                        shift=args.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sample_steps,
+                        guide_scale=args.sample_guide_scale,
+                        seed=seed,
+                        offload_model=args.offload_model
+                    )
+                
+                if rank == 0:
+                    if save_file is None:
+                        formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        formatted_prompt = prompt.replace(" ", "_").replace("/", "_")[:50]
+                        save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}.mp4"
+                    
+                    save_video(
+                        tensor=video[None],
+                        save_file=save_file,
+                        fps=cfg.sample_fps,
+                        nrow=1,
+                        normalize=True,
+                        value_range=(-1, 1))
+                    
+                    if "s2v" in args.task:
+                        if task.get("enable_tts", args.enable_tts) is False:
+                            merge_video_audio(video_path=save_file, audio_path=task.get("audio", args.audio))
+                        else:
+                            merge_video_audio(video_path=save_file, audio_path="tts.wav")
+                    
+                    sys.stdout.write(json.dumps({"status": "success", "save_file": save_file}) + "\n")
+                    sys.stdout.flush()
+                del video
+            except Exception as e:
+                import traceback
+                if rank == 0:
+                    sys.stdout.write(json.dumps({"status": "error", "error": str(e), "traceback": traceback.format_exc()}) + "\n")
+                    sys.stdout.flush()
+        
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        return
+
         logging.info("Generating video ...")
         video = wan_i2v.generate(
             args.prompt,
@@ -537,7 +721,8 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model,
+            n_prompt=args.n_prompt)
 
     if rank == 0:
         if args.save_file is None:
