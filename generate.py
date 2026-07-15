@@ -544,9 +544,8 @@ def generate(args):
     
     if getattr(args, "daemon", False):
         import json
-        if rank == 0:
-            sys.stdout.write("READY\n")
-            sys.stdout.flush()
+        sys.stdout.write("READY\n")
+        sys.stdout.flush()
         
         while True:
             if rank == 0:
@@ -577,7 +576,7 @@ def generate(args):
             
             prompt = task.get("prompt", args.prompt)
             image_path = task.get("input_image", args.image)
-            save_file = task.get("output_video", args.save_file)
+            save_file = task.get("output_path", task.get("output_video", args.save_file))
             seed = task.get("seed", args.base_seed)
             if seed < 0:
                 seed = random.randint(0, sys.maxsize)
