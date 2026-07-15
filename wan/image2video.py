@@ -327,6 +327,7 @@ class WanI2V:
             context_null = self.text_encoder([n_prompt], self.device)
             if offload_model:
                 self.text_encoder.model.cpu()
+                torch.cuda.empty_cache()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
@@ -435,8 +436,10 @@ class WanI2V:
                 del latent_model_input, timestep
 
             if offload_model:
-                self.low_noise_model.cpu()
-                self.high_noise_model.cpu()
+                if self.low_noise_model is not None:
+                    self.low_noise_model.cpu()
+                if self.high_noise_model is not None:
+                    self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
 
             videos = self.vae.decode(x0)
