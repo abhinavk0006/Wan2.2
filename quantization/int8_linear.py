@@ -64,6 +64,11 @@ class Int8Linear(nn.Module):
             dtype=linear.weight.dtype,
         )
 
+        # Keep replacements beside the source module. In particular, this
+        # allows a GPU-loaded Wan expert to be quantized in place without
+        # silently copying every replacement back to CPU.
+        result = result.to(device=linear.weight.device)
+
         weight = linear.weight.detach().float()
 
         max_abs = weight.abs().max()
@@ -81,17 +86,15 @@ class Int8Linear(nn.Module):
             weight / scale
         ).clamp(-128, 127).to(torch.int8)
 
-        result.weight_int8.copy_(
-            weight_int8.cpu()
-        )
+        result.weight_int8.copy_(weight_int8)
 
         result.scale.copy_(
-            scale.detach().float().cpu()
+            scale.detach().float()
         )
 
         if linear.bias is not None:
             result.bias.copy_(
-                linear.bias.detach().cpu()
+                linear.bias.detach()
             )
 
         return result
