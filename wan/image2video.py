@@ -408,6 +408,11 @@ class WanI2V:
 
                 timestep = torch.stack(timestep).to(self.device)
 
+                # Drop the previous expert's local reference before lazy
+                # loading the next one. This matters for staged/offloaded
+                # inference, where the prior expert must be released to free
+                # GPU memory before the next checkpoint is loaded.
+                model = None
                 model = self._prepare_model_for_timestep(
                     t, boundary, offload_model)
                 sample_guide_scale = guide_scale[1] if t.item(
