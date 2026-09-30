@@ -65,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frames", type=int, default=17)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
+        "--max-memory-gib",
+        type=float,
+        default=8.0,
+        help="Maximum planned DiT storage per GPU; leave headroom for T4 activations",
+    )
+    parser.add_argument(
         "--model-dir",
         type=Path,
         help="Optional local Wan 2.2 I2V model directory with high_noise_model, low_noise_model, T5, and VAE files",
@@ -80,6 +86,10 @@ def main() -> None:
         raise RuntimeError("Enable a Kaggle GPU accelerator before running this script.")
     if args.device < 0 or args.device >= torch.cuda.device_count():
         raise ValueError(f"GPU {args.device} is unavailable on this Kaggle session.")
+    if torch.cuda.device_count() < 2:
+        raise RuntimeError(
+            "This staged 14B Kaggle path needs two visible GPUs so the expert can be sharded."
+        )
     if not args.image.is_file():
         raise FileNotFoundError(
             f"Input image not found: {args.image}. Upload an image as a Kaggle input and pass --image /kaggle/input/.../your_image.png"
@@ -138,7 +148,8 @@ def main() -> None:
         pass
     else:
         # The upstream loop calls this hook at every denoising step. Keep only
-        # the active expert and stream its Comfy FP8 source from Hugging Face.
+        # the active expert, stream it, and shard whole transformer blocks over
+        # both T4s so neither card needs to hold the entire 14B expert.
         def prepare_expert(self, t, boundary, offload_model):
             del offload_model
             expert_name = (
@@ -165,6 +176,7 @@ def main() -> None:
                 )
                 try:
                     from kaggle_single_expert import load_fp8_scaled_wan_checkpoint
+                    from kaggle_single_expert import dispatch_wan_model_across_gpus
 
                     logging.info("Converting %s to custom INT8 Linear layers", expert_name)
                     expert, details = load_fp8_scaled_wan_checkpoint(checkpoint)
@@ -173,7 +185,15 @@ def main() -> None:
                         details["fp8_scaled_weights_decoded"],
                         details["int8_modules"],
                     )
-                    expert.eval().requires_grad_(False).to(self.device)
+                    gpu_ids = [self.device.index] + [
+                        index
+                        for index in range(torch.cuda.device_count())
+                        if index != self.device.index
+                    ]
+                    expert, device_map = dispatch_wan_model_across_gpus(
+                        expert, gpu_ids, max_memory_gib=args.max_memory_gib
+                    )
+                    logging.info("Expert device map: %s", device_map)
                     torch.cuda.synchronize(self.device)
                     setattr(self, expert_name, expert)
                 finally:
@@ -218,5 +238,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(REPO_ROOT))
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     main()

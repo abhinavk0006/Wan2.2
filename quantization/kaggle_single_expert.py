@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import re
 import sys
 import time
@@ -27,6 +28,7 @@ import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from quantize_model import (  # noqa: E402
@@ -301,6 +303,49 @@ def load_fp8_scaled_wan_checkpoint(checkpoint_file: Path) -> tuple[torch.nn.Modu
     }
 
 
+def dispatch_wan_model_across_gpus(
+    model: torch.nn.Module,
+    gpu_ids: list[int],
+    max_memory_gib: float = 8.0,
+) -> tuple[torch.nn.Module, dict[str, object]]:
+    """Place whole Wan transformer blocks across multiple CUDA devices.
+
+    The two T4s in a Kaggle session do not pool VRAM automatically. Accelerate
+    installs module hooks that move block inputs between the selected GPUs.
+    Keep several GiB free on each device for attention and INT8 dequantization
+    workspaces.
+    """
+    if len(gpu_ids) < 2:
+        raise ValueError("At least two CUDA devices are required for model sharding.")
+    if any(device_id < 0 or device_id >= torch.cuda.device_count() for device_id in gpu_ids):
+        raise ValueError(f"Invalid CUDA device list: {gpu_ids}")
+
+    try:
+        from accelerate import dispatch_model, infer_auto_device_map
+    except ImportError as exc:
+        raise RuntimeError("Multi-GPU placement needs accelerate.") from exc
+
+    max_memory = {device_id: f"{max_memory_gib:g}GiB" for device_id in gpu_ids}
+    device_map = infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=["WanAttentionBlock"],
+        dtype=torch.float16,
+        clean_result=True,
+    )
+    assigned_devices = set(device_map.values())
+    allowed_devices = set(gpu_ids)
+    if not assigned_devices.issubset(allowed_devices):
+        raise RuntimeError(
+            "Wan model does not fit within the requested per-GPU memory budget "
+            f"without CPU/disk offload: {device_map}"
+        )
+
+    logging.info("Dispatching Wan blocks over CUDA devices: %s", device_map)
+    model = dispatch_model(model, device_map=device_map, main_device=gpu_ids[0])
+    return model, {str(module): device for module, device in device_map.items()}
+
+
 def run(args: argparse.Namespace) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable. In Kaggle, select a GPU accelerator.")
@@ -317,12 +362,17 @@ def run(args: argparse.Namespace) -> dict:
         raise RuntimeError(
             "This GPU does not support BF16. Use --dtype float16 on a Tesla T4."
         )
+    if args.two_gpu and torch.cuda.device_count() < 2:
+        raise RuntimeError("--two-gpu needs at least two visible CUDA devices.")
 
     props = torch.cuda.get_device_properties(device)
     print(f"GPU: {props.name} ({props.total_memory / 1024**3:.2f} GiB)")
     print(f"Checkpoint: {checkpoint_file or expert_dir}")
     print(f"Load/compute dtype: {args.dtype}")
     torch.cuda.reset_peak_memory_stats(device)
+    if args.two_gpu:
+        for index in range(torch.cuda.device_count()):
+            torch.cuda.reset_peak_memory_stats(index)
     report = {
         "expert_dir": str(expert_dir) if expert_dir else None,
         "checkpoint_file": str(checkpoint_file) if checkpoint_file else None,
@@ -407,7 +457,16 @@ def run(args: argparse.Namespace) -> dict:
     torch.cuda.empty_cache()
     started = time.perf_counter()
     try:
-        model.to(device)
+        if args.two_gpu:
+            gpu_ids = [args.device] + [
+                index
+                for index in range(torch.cuda.device_count())
+                if index != args.device
+            ]
+            model, device_map = dispatch_wan_model_across_gpus(model, gpu_ids)
+            report["device_map"] = device_map
+        else:
+            model.to(device)
         torch.cuda.synchronize(device)
     except torch.cuda.OutOfMemoryError as exc:
         report["status"] = "GPU_LOAD_OOM"
@@ -420,6 +479,10 @@ def run(args: argparse.Namespace) -> dict:
     report["cuda_transfer_seconds"] = time.perf_counter() - started
     report["gpu_allocated_after_load_bytes"] = torch.cuda.memory_allocated(device)
     report["gpu_reserved_after_load_bytes"] = torch.cuda.memory_reserved(device)
+    report["gpu_allocated_after_load_by_device"] = {
+        str(index): torch.cuda.memory_allocated(index)
+        for index in range(torch.cuda.device_count())
+    }
 
     if not args.skip_forward:
         # Minimal I2V-shaped inputs exercise every block and its CUDA attention
@@ -462,6 +525,10 @@ def run(args: argparse.Namespace) -> dict:
         )
         report["gpu_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
         report["gpu_peak_reserved_bytes"] = torch.cuda.max_memory_reserved(device)
+        report["gpu_peak_allocated_by_device"] = {
+            str(index): torch.cuda.max_memory_allocated(index)
+            for index in range(torch.cuda.device_count())
+        }
         print(
             f"Expert forward PASS in {report['forward_seconds']:.1f}s; "
             f"output={report['forward_output_shapes']}; "
@@ -490,6 +557,11 @@ def main() -> None:
         help="One Comfy Wan FP8-scaled .safetensors expert checkpoint",
     )
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument(
+        "--two-gpu",
+        action="store_true",
+        help="Shard whole Wan blocks across two GPUs, reserving about 6.5 GiB per T4 for workspaces",
+    )
     parser.add_argument(
         "--dtype", choices=("float16", "bfloat16"), default="float16"
     )

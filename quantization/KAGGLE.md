@@ -6,8 +6,10 @@ an expert smoke test. It downloads the T5 and VAE checkpoints from
 DiT experts from `Comfy-Org/Wan_2.2_ComfyUI_Repackaged` one at a time. Each
 expert is converted to this repository's experimental custom weight-only INT8
 Linear layers. Source checkpoint files are deleted after loading to reduce
-working-disk use. This full 14B path is memory- and time-intensive on a T4, and
-the custom Linear implementation dequantizes its weights on each forward pass.
+working-disk use. A single-T4 check found that stored INT8 weights fit, but the
+forward pass ran out of temporary VRAM while expanding a matrix to float32.
+The Kaggle runner now has an experimental two-GPU option that places whole
+transformer blocks across both T4s and moves activations between them.
 
 ## Kaggle setup
 
@@ -31,6 +33,7 @@ the custom Linear implementation dequantizes its weights on each forward pass.
        --prompt "A gentle camera push-in; the subject moves naturally." \
        --frames 17 \
        --steps 20 \
+       --max-memory-gib 8 \
        --output /kaggle/working/wan_i2v_preview.mp4
    ```
 
@@ -43,11 +46,21 @@ the custom Linear implementation dequantizes its weights on each forward pass.
 
 ## Limits
 
-Kaggle's two T4 GPUs do not combine into one larger GPU here; the script uses
-one selected GPU (`--device 0` by default). If CUDA out-of-memory occurs, try
-`--device 1` in a fresh run. The 480p 14B experts may still exceed available
-VRAM after conversion. The custom loader accepts the Comfy Wan FP8-scaled key
-layout with scalar per-tensor scales; unsupported formats stop with an error.
+Kaggle's two T4 GPUs do not combine into one larger GPU; `--two-gpu` explicitly
+shards the transformer blocks and moves activations between cards. Before
+generating a video, test one expert across both visible GPUs with:
+
+```python
+!python quantization/kaggle_single_expert.py \
+    --checkpoint-file /kaggle/working/wan_models/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors \
+    --dtype float16 --device 0 --two-gpu \
+    --report /kaggle/working/high_noise_int8_report.json
+```
+
+The custom Linear implementation still expands weights during every forward
+pass, so two-GPU inference remains experimental and may be slow. The custom
+loader accepts the Comfy Wan FP8-scaled key layout with scalar per-tensor
+scales; unsupported formats stop with an error.
 
 The separate `kaggle_single_expert.py` command remains available for loading
 and smoke-testing one expert. It does not generate a video.
