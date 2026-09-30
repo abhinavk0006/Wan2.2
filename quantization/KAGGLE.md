@@ -1,65 +1,53 @@
-# Kaggle single-expert INT8 validation
+# Kaggle Wan image-to-video
 
-This first GPU gate loads one Wan I2V expert, replaces its `nn.Linear` layers
-with the custom weight-only INT8 modules, transfers the compressed expert to
-CUDA, and runs a minimal I2V-shaped forward pass. Run high-noise and low-noise
-experts in separate Kaggle sessions so only one A14B expert is resident at a
-time.
-
-## Checkpoint formats
-
-The runner supports either a Diffusers WanModel expert directory or the
-standalone Comfy Wan FP8-scaled `.safetensors` file. For the FP8 checkpoint it
-infers the Wan architecture from tensor shapes, decodes each FP8 tensor with
-its scalar `scale_weight`, and immediately converts each Linear matrix to the
-custom INT8 representation. It streams tensors one at a time, so Kaggle does
-not need a full FP16 expert copy in CPU RAM. Unsupported key layouts or
-non-scalar scales fail with an explicit error instead of being guessed.
+The Kaggle generation entry point creates an I2V MP4 rather than only running
+an expert smoke test. It downloads the T5 and VAE checkpoints from
+`Wan-AI/Wan2.2-I2V-A14B`, then downloads the high-noise and low-noise FP8-scaled
+DiT experts from `Comfy-Org/Wan_2.2_ComfyUI_Repackaged` one at a time. Each
+expert is converted to this repository's experimental custom weight-only INT8
+Linear layers. Source checkpoint files are deleted after loading to reduce
+working-disk use. This full 14B path is memory- and time-intensive on a T4, and
+the custom Linear implementation dequantizes its weights on each forward pass.
 
 ## Kaggle setup
 
-1. Create a Kaggle notebook with a GPU accelerator (the T4 uses FP16).
-2. Add this repository's updated code and the high-noise FP8-scaled checkpoint
-   dataset as notebook inputs. The handoff paths are expected to look like
-   `/kaggle/input/wan2-2-i2v-high-noise-14b-fp8-scaled/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors`.
-   Add the low-noise dataset for the second run, after restarting the session.
-3. In a setup cell, install only the Python dependencies not already present;
-   keep Kaggle's installed PyTorch/CUDA build:
+1. Create a Kaggle notebook, enable Internet and a GPU accelerator, and clone
+   this repository.
+2. Install dependencies without replacing Kaggle's PyTorch/CUDA build:
 
    ```python
+   %cd /kaggle/working/Wan2.2
    %pip install 'diffusers>=0.31,<0.33' 'transformers>=4.49,<=4.51.3' \
-       'accelerate>=1.1.1' easydict safetensors ftfy
+       'accelerate>=1.1.1' easydict safetensors ftfy huggingface_hub imageio imageio-ffmpeg
    ```
 
-   Flash Attention is optional here: Wan's attention wrapper falls back to
-   PyTorch SDPA when Flash Attention is absent. Do not reinstall PyTorch.
-
-4. Run the HIGH-noise expert first (adjust the Kaggle input path if its dataset
-   slug differs):
+3. Upload an input image using Kaggle's Add Input control. Your current image
+   is `/kaggle/input/datasets/abhinavk0006/testimage/1.jpeg`. Run:
 
    ```python
-   %cd /kaggle/input/wan22-code/Wan2.2
-   !python quantization/kaggle_single_expert.py \
-       --checkpoint-file /kaggle/input/wan2-2-i2v-high-noise-14b-fp8-scaled/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors \
-       --dtype float16 \
-       --report /kaggle/working/high_noise_int8_report.json
+   %cd /kaggle/working/Wan2.2
+   !python quantization/kaggle_generate_video.py \
+       --image /kaggle/input/datasets/abhinavk0006/testimage/1.jpeg \
+       --prompt "A gentle camera push-in; the subject moves naturally." \
+       --frames 17 \
+       --steps 20 \
+       --output /kaggle/working/wan_i2v_preview.mp4
    ```
 
-5. Save/download the JSON report, restart the Kaggle session to clear memory,
-   then run the LOW-noise expert by changing the checkpoint path to
-   `wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors` and the report name.
+   The `17` frame preview is a short first attempt. Use `49` frames after a
+   successful run for a longer clip. Frame counts must be `4n+1`.
 
-The runner records stream/dequantization/quantization time, number of replaced layers,
-model tensor-storage reduction, transfer time, CUDA peak allocated/reserved
-memory, forward time, output shape, and finite-output status. It does not claim
-that this weight-only prototype is faster: `Int8Linear` dequantizes each weight
-matrix before `F.linear`.
+4. When the command finishes, the MP4 is at
+   `/kaggle/working/wan_i2v_preview.mp4`. Download it from the Kaggle output
+   pane or copy it into a Kaggle dataset for reuse.
 
-## What this gate does not establish
+## Limits
 
-Passing both expert runs establishes that each expert can load, be quantized,
-fit on the selected GPU for a minimal forward, and produce finite output. It
-does not establish full 832x480x49 I2V generation or visual quality. Those
-remain the next gate after both experts pass. Compare against existing
-quantized checkpoints if their supported runtime is easier to run or gives a
-better memory/quality/speed tradeoff.
+Kaggle's two T4 GPUs do not combine into one larger GPU here; the script uses
+one selected GPU (`--device 0` by default). If CUDA out-of-memory occurs, try
+`--device 1` in a fresh run. The 480p 14B experts may still exceed available
+VRAM after conversion. The custom loader accepts the Comfy Wan FP8-scaled key
+layout with scalar per-tensor scales; unsupported formats stop with an error.
+
+The separate `kaggle_single_expert.py` command remains available for loading
+and smoke-testing one expert. It does not generate a video.
