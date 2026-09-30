@@ -5,3 +5,5 @@ tmp_examples*
 new_checkpoint*
 batch_test*
 nohup*Wan2.2-I2V-A14B/
+
+quantization/test_int8_checkpoint.pt
