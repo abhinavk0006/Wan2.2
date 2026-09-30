@@ -10,6 +10,8 @@ working-disk use. A single-T4 check found that stored INT8 weights fit, but the
 forward pass ran out of temporary VRAM while expanding a matrix to float32.
 The Kaggle runner now has an experimental two-GPU option that places whole
 transformer blocks across both T4s and moves activations between them.
+Wan's transformer uses the repository's PyTorch scaled-dot-product-attention
+fallback when FlashAttention is unavailable, as on this Kaggle setup.
 
 ## Kaggle setup
 
