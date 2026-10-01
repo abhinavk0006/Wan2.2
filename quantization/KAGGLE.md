@@ -42,6 +42,31 @@ fallback when FlashAttention is unavailable, as on this Kaggle setup.
    The `17` frame preview is a short first attempt. Use `49` frames after a
    successful run for a longer clip. Frame counts must be `4n+1`.
 
+## Four-step Lightning experiment
+
+Use the same setup cell and input image with `--lightning`. This downloads the
+official 4-step I2V-A14B adapter for each expert when that expert is first
+loaded, merges the rank-64 update into streamed base weights before INT8
+conversion, and samples with four shifted Euler steps and guidance scales
+`(1, 1)`.
+
+```python
+%cd /kaggle/working/Wan2.2
+!python quantization/kaggle_generate_video.py \
+    --image /kaggle/input/datasets/abhinavk0006/testimage/1.jpeg \
+    --prompt "A gentle camera push-in; the subject moves naturally." \
+    --lightning \
+    --frames 17 \
+    --max-memory-gib 8 \
+    --output /kaggle/working/wan_i2v_lightning_4step.mp4
+```
+
+The first run still needs to download T5, VAE, both base experts, and both
+adapters, and quantize each expert when it is first activated. Four steps
+reduce denoising work but do not eliminate initial load and conversion costs.
+Laptop checks validate adapter structure and merge math only; the Kaggle run
+is required to validate actual video generation.
+
 4. When the command finishes, the MP4 is at
    `/kaggle/working/wan_i2v_preview.mp4`. Download it from the Kaggle output
    pane or copy it into a Kaggle dataset for reuse.

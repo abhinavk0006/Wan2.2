@@ -7,6 +7,9 @@ converted to this repository's custom weight-only INT8 layers one at a time.
 This is an experimental route: INT8 Linear weights are dequantized on each
 forward pass, so generation can be slow. The full 14B experts may also exceed
 one T4's available VRAM. This script is not a performance claim.
+
+Use ``--lightning`` to merge the official four-step I2V-A14B LoRA into each
+expert during streamed loading and sample with the matching shifted Euler path.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MODELS_DIR = Path("/kaggle/working/wan_models")
 HF_I2V_REPO = "Wan-AI/Wan2.2-I2V-A14B"
 HF_COMFY_REPO = "Comfy-Org/Wan_2.2_ComfyUI_Repackaged"
+HF_LIGHTNING_REPO = "lightx2v/Wan2.2-Lightning"
+LIGHTNING_ADAPTER_DIR = "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1"
 COMFY_PREFIX = "split_files/diffusion_models/"
 EXPERT_FILES = {
     "high_noise_model": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
@@ -62,6 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", type=Path, default=Path("/kaggle/working/wan_i2v_preview.mp4")
     )
     parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument(
+        "--lightning",
+        action="store_true",
+        help="Merge the official 4-step I2V-A14B Lightning LoRAs into each expert before INT8 conversion, then use shifted Euler sampling",
+    )
     parser.add_argument("--frames", type=int, default=17)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
@@ -94,6 +104,12 @@ def main() -> None:
         raise FileNotFoundError(
             f"Input image not found: {args.image}. Upload an image as a Kaggle input and pass --image /kaggle/input/.../your_image.png"
         )
+    if args.lightning and args.model_dir:
+        raise ValueError("--lightning currently requires the streamed Comfy FP8 checkpoint path; omit --model-dir.")
+    if args.lightning and args.steps not in (4, 20):
+        raise ValueError("The Lightning adapter is distilled for exactly 4 steps; pass --steps 4 or omit --steps.")
+    if args.lightning:
+        args.steps = 4
     if args.steps < 2:
         raise ValueError("Use at least 2 denoising steps so both experts can run.")
     if args.frames < 1 or (args.frames - 1) % 4:
@@ -109,6 +125,10 @@ def main() -> None:
     config = copy.deepcopy(WAN_CONFIGS["i2v-A14B"])
     config.param_dtype = torch.float16
     config.t5_dtype = torch.bfloat16
+    if args.lightning:
+        config.sample_shift = 5.0
+        config.sample_steps = 4
+        config.sample_guide_scale = (1.0, 1.0)
 
     # The local-directory path is for a compatible full checkpoint prepared
     # elsewhere. The default path stages Comfy FP8 experts from Hugging Face.
@@ -174,16 +194,31 @@ def main() -> None:
                     COMFY_PREFIX + EXPERT_FILES[expert_name],
                     MODELS_DIR,
                 )
+                adapter = None
                 try:
+                    if args.lightning:
+                        adapter_filename = f"{expert_name}.safetensors"
+                        adapter = download(
+                            HF_LIGHTNING_REPO,
+                            f"{LIGHTNING_ADAPTER_DIR}/{adapter_filename}",
+                            MODELS_DIR / "lightning",
+                        )
                     from kaggle_single_expert import load_fp8_scaled_wan_checkpoint
                     from kaggle_single_expert import dispatch_wan_model_across_gpus
 
-                    logging.info("Converting %s to custom INT8 Linear layers", expert_name)
-                    expert, details = load_fp8_scaled_wan_checkpoint(checkpoint)
                     logging.info(
-                        "Converted %s FP8 tensors; replaced %s Linear layers",
+                        "Converting %s to custom INT8 Linear layers%s",
+                        expert_name,
+                        " with merged 4-step Lightning LoRA" if adapter else "",
+                    )
+                    expert, details = load_fp8_scaled_wan_checkpoint(
+                        checkpoint, lora_file=adapter
+                    )
+                    logging.info(
+                        "Converted %s FP8 tensors; replaced %s Linear layers; merged %s LoRA targets",
                         details["fp8_scaled_weights_decoded"],
                         details["int8_modules"],
+                        details["lora_targets_merged"],
                     )
                     gpu_ids = [self.device.index] + [
                         index
@@ -198,6 +233,8 @@ def main() -> None:
                     setattr(self, expert_name, expert)
                 finally:
                     checkpoint.unlink(missing_ok=True)
+                    if adapter is not None:
+                        adapter.unlink(missing_ok=True)
                     gc.collect()
                 logging.info("Loaded %s on %s", expert_name, self.device)
             return getattr(self, expert_name)
@@ -215,10 +252,11 @@ def main() -> None:
             img=image.convert("RGB"),
             max_area=480 * 832,
             frame_num=args.frames,
-            sample_solver="unipc",
+            sample_solver="euler" if args.lightning else "unipc",
             sampling_steps=args.steps,
-            guide_scale=(3.5, 3.5),
+            guide_scale=(1.0, 1.0) if args.lightning else (3.5, 3.5),
             seed=42,
+            shift=5.0,
             offload_model=bool(args.model_dir),
         )
     save_video(

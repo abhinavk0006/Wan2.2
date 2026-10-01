@@ -22,6 +22,7 @@ import logging
 import re
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -37,6 +38,10 @@ from quantize_model import (  # noqa: E402
     quantize_linear_modules,
 )
 from int8_linear import Int8Linear  # noqa: E402
+from quantization.optimization.lora import (  # noqa: E402
+    merge_lora_weight,
+    plan_lora_tensors,
+)
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -118,7 +123,10 @@ def _dequantize_fp8_tensor(tensor: torch.Tensor, scale: torch.Tensor | None) -> 
     return tensor.float()
 
 
-def load_fp8_scaled_wan_checkpoint(checkpoint_file: Path) -> tuple[torch.nn.Module, dict]:
+def load_fp8_scaled_wan_checkpoint(
+    checkpoint_file: Path,
+    lora_file: Path | None = None,
+) -> tuple[torch.nn.Module, dict]:
     """Build a meta Wan I2V model and stream a Comfy FP8-scaled checkpoint into it.
 
     The old Comfy Wan format stores weights as FP8 with a scalar
@@ -138,7 +146,20 @@ def load_fp8_scaled_wan_checkpoint(checkpoint_file: Path) -> tuple[torch.nn.Modu
 
     from wan.modules.model import WanModel
 
-    with safe_open(str(checkpoint_file), framework="pt", device="cpu") as handle:
+    if lora_file is not None and not lora_file.is_file():
+        raise FileNotFoundError(lora_file)
+
+    with ExitStack() as stack:
+        handle = stack.enter_context(
+            safe_open(str(checkpoint_file), framework="pt", device="cpu")
+        )
+        adapter = (
+            stack.enter_context(
+                safe_open(str(lora_file), framework="pt", device="cpu")
+            )
+            if lora_file is not None
+            else None
+        )
         raw_keys = list(handle.keys())
         key_map = _checkpoint_key_map(raw_keys)
         required = (
@@ -200,8 +221,28 @@ def load_fp8_scaled_wan_checkpoint(checkpoint_file: Path) -> tuple[torch.nn.Modu
             )
         _replace_linears_with_empty_int8(model)
 
+        lora_plans = {}
+        if adapter is not None:
+            linear_dimensions = {
+                name: (module.in_features, module.out_features)
+                for name, module in model.named_modules()
+                if isinstance(module, Int8Linear) and name.startswith("blocks.")
+            }
+            adapter_keys = set(adapter.keys())
+            adapter_shapes = {
+                key: tuple(adapter.get_slice(key).get_shape())
+                for key in adapter_keys
+            }
+            lora_plans = plan_lora_tensors(
+                linear_dimensions,
+                adapter_keys,
+                adapter_shapes,
+                expected_targets=set(linear_dimensions),
+            )
+
         params_loaded = 0
         fp8_scaled_weights = 0
+        lora_targets_merged = 0
         quantization_started = time.perf_counter()
         int8_linear_count = count_int8_modules(model)
         for name, module in model.named_modules():
@@ -225,6 +266,15 @@ def load_fp8_scaled_wan_checkpoint(checkpoint_file: Path) -> tuple[torch.nn.Modu
                         f"{weight_name} shape {tuple(weight.shape)} does not match "
                         f"Linear {(module.out_features, module.in_features)}"
                     )
+                lora_plan = lora_plans.get(name)
+                if lora_plan is not None:
+                    weight = merge_lora_weight(
+                        weight,
+                        adapter.get_tensor(lora_plan.down_key),
+                        adapter.get_tensor(lora_plan.up_key),
+                        adapter.get_tensor(lora_plan.alpha_key),
+                    )
+                    lora_targets_merged += 1
                 maximum = weight.abs().max()
                 quant_scale = maximum / 127.0 if maximum.item() else torch.tensor(1.0)
                 quantized = torch.round(weight / quant_scale).clamp(-127, 127).to(torch.int8)
@@ -276,6 +326,10 @@ def load_fp8_scaled_wan_checkpoint(checkpoint_file: Path) -> tuple[torch.nn.Modu
 
         if count_int8_modules(model) != int8_linear_count:
             raise RuntimeError("Some Linear modules were not replaced with Int8Linear")
+        if lora_targets_merged != len(lora_plans):
+            raise RuntimeError(
+                f"Merged {lora_targets_merged} LoRA targets, expected {len(lora_plans)}"
+            )
 
         dense_fp16_bytes = sum(
             parameter.numel() * 2
@@ -298,6 +352,11 @@ def load_fp8_scaled_wan_checkpoint(checkpoint_file: Path) -> tuple[torch.nn.Modu
         "model_parameters_loaded": params_loaded,
         "fp8_scaled_weights_decoded": fp8_scaled_weights,
         "int8_modules": int8_linear_count,
+        "lora_file": str(lora_file) if lora_file else None,
+        "lora_targets_merged": lora_targets_merged,
+        "lora_max_rank": max(
+            (target.rank for target in lora_plans.values()), default=0
+        ),
         "model_storage_bytes_before": dense_fp16_bytes,
         "quantize_seconds": time.perf_counter() - quantization_started,
     }

@@ -19,6 +19,7 @@ from tqdm import tqdm
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
+from quantization.optimization.euler import build_flow_euler_schedule
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
@@ -381,6 +382,14 @@ class WanI2V:
                     sample_scheduler,
                     device=self.device,
                     sigmas=sampling_sigmas)
+            elif sample_solver == 'euler':
+                sample_scheduler = build_flow_euler_schedule(
+                    train_steps=self.num_train_timesteps,
+                    inference_steps=sampling_steps,
+                    shift=shift,
+                    device=self.device,
+                )
+                timesteps = sample_scheduler.timesteps
             else:
                 raise NotImplementedError("Unsupported solver.")
 
@@ -402,7 +411,7 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for step_index, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
@@ -422,19 +431,29 @@ class WanI2V:
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
-                noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                if abs(float(sample_guide_scale) - 1.0) <= 1e-6:
+                    noise_pred = noise_pred_cond
+                else:
+                    noise_pred_uncond = model(
+                        latent_model_input, t=timestep, **arg_null)[0]
+                    if offload_model:
+                        torch.cuda.empty_cache()
+                    noise_pred = noise_pred_uncond + sample_guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
+                if sample_solver == 'euler':
+                    temp_x0 = sample_scheduler.step(
+                        latent.unsqueeze(0),
+                        noise_pred.unsqueeze(0),
+                        step_index,
+                    )
+                else:
+                    temp_x0 = sample_scheduler.step(
+                        noise_pred.unsqueeze(0),
+                        t,
+                        latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
 
                 x0 = [latent]

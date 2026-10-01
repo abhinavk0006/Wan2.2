@@ -49,7 +49,7 @@ modelscope = "https://modelscope.cn/organization/Wan-AI"
 discord = "https://discord.gg/p5XbdQV7"
 
 [tool.setuptools]
-packages = ["wan"]
+packages = ["wan", "quantization", "quantization.optimization"]
 
 [tool.setuptools.package-data]
 "wan" = ["**/*.py"]
