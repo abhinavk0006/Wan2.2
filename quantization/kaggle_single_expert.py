@@ -366,6 +366,7 @@ def dispatch_wan_model_across_gpus(
     model: torch.nn.Module,
     gpu_ids: list[int],
     max_memory_gib: float = 8.0,
+    max_memory_gib_by_device: dict[int, float] | None = None,
 ) -> tuple[torch.nn.Module, dict[str, object]]:
     """Place whole Wan transformer blocks across multiple CUDA devices.
 
@@ -384,7 +385,12 @@ def dispatch_wan_model_across_gpus(
     except ImportError as exc:
         raise RuntimeError("Multi-GPU placement needs accelerate.") from exc
 
-    max_memory = {device_id: f"{max_memory_gib:g}GiB" for device_id in gpu_ids}
+    max_memory = {}
+    for device_id in gpu_ids:
+        budget = (max_memory_gib_by_device or {}).get(device_id, max_memory_gib)
+        if budget <= 0:
+            raise ValueError(f"GPU {device_id} memory budget must be positive, got {budget} GiB")
+        max_memory[device_id] = f"{budget:g}GiB"
     device_map = infer_auto_device_map(
         model,
         max_memory=max_memory,

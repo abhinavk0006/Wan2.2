@@ -83,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum planned DiT storage per GPU; leave headroom for T4 activations",
     )
     parser.add_argument(
+        "--gpu0-memory-gib", type=float,
+        help="Override the planned DiT storage budget for CUDA device 0",
+    )
+    parser.add_argument(
+        "--gpu1-memory-gib", type=float,
+        help="Override the planned DiT storage budget for CUDA device 1",
+    )
+    parser.add_argument(
         "--model-dir",
         type=Path,
         help="Optional local Wan 2.2 I2V model directory with high_noise_model, low_noise_model, T5, and VAE files",
@@ -239,7 +247,17 @@ def main() -> None:
                         if index != self.device.index
                     ]
                     expert, device_map = dispatch_wan_model_across_gpus(
-                        expert, gpu_ids, max_memory_gib=args.max_memory_gib
+                        expert,
+                        gpu_ids,
+                        max_memory_gib=args.max_memory_gib,
+                        max_memory_gib_by_device={
+                            device_id: budget
+                            for device_id, budget in (
+                                (0, args.gpu0_memory_gib),
+                                (1, args.gpu1_memory_gib),
+                            )
+                            if budget is not None
+                        },
                     )
                     logging.info("Expert device map: %s", device_map)
                     torch.cuda.synchronize(self.device)
