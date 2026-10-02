@@ -63,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prompt",
         default="A gentle camera push-in. The subject moves naturally while the scene remains consistent.",
     )
+    parser.add_argument("--negative-prompt", default="")
     parser.add_argument(
         "--output", type=Path, default=Path("/kaggle/working/wan_i2v_preview.mp4")
     )
@@ -73,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Merge the official 4-step I2V-A14B Lightning LoRAs into each expert before INT8 conversion, then use shifted Euler sampling",
     )
     parser.add_argument("--frames", type=int, default=17)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
         "--max-memory-gib",
@@ -260,13 +262,14 @@ def main() -> None:
     with Image.open(args.image) as image:
         video = model.generate(
             input_prompt=args.prompt,
+            n_prompt=args.negative_prompt,
             img=image.convert("RGB"),
             max_area=480 * 832,
             frame_num=args.frames,
             sample_solver="euler" if args.lightning else "unipc",
             sampling_steps=args.steps,
             guide_scale=(1.0, 1.0) if args.lightning else (3.5, 3.5),
-            seed=42,
+            seed=args.seed,
             shift=5.0,
             offload_model=bool(args.model_dir),
         )
