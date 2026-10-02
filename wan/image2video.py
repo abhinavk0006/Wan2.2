@@ -77,6 +77,9 @@ class WanI2V:
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        # Optional for one-shot, memory-constrained generation: once both
+        # prompts are encoded, the large CPU T5 weights are no longer needed.
+        self.release_t5_after_encode = False
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -343,6 +346,9 @@ class WanI2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+            if self.release_t5_after_encode:
+                self.text_encoder.model = None
+                gc.collect()
 
         y = self.vae.encode([
             torch.concat([

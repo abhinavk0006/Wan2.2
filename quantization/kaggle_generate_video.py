@@ -167,6 +167,10 @@ def main() -> None:
                 component_path.unlink(missing_ok=True)
         gc.collect()
 
+    # This script generates one video per process. Release the 11+ GiB CPU T5
+    # weights after prompt encoding, before streaming either 14B DiT expert.
+    model.release_t5_after_encode = True
+
     if args.model_dir:
         # The upstream method loads both experts from Diffusers folders and
         # offloads inactive weights to CPU. This supports a full prepared pair.
