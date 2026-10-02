@@ -85,13 +85,22 @@ class WanI2V:
         if t5_fsdp or dit_fsdp or use_sp:
             self.init_on_cpu = False
 
+        # Wan configs normally name the tokenizer by its Hugging Face repo ID
+        # (for example, ``google/umt5-xxl``). Use a checkpoint-local copy only
+        # when that directory exists; joining the ID to checkpoint_dir makes
+        # Transformers mistake it for a missing local path instead of a Hub ID.
+        tokenizer_path = config.t5_tokenizer
+        local_tokenizer_path = os.path.join(checkpoint_dir, tokenizer_path)
+        if os.path.isdir(local_tokenizer_path):
+            tokenizer_path = local_tokenizer_path
+
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+            tokenizer_path=tokenizer_path,
             shard_fn=shard_fn if t5_fsdp else None,
         )
 

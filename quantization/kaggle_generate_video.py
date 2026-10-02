@@ -148,6 +148,7 @@ def main() -> None:
             download(HF_I2V_REPO, config.vae_checkpoint, MODELS_DIR),
         ]
 
+    model = None
     try:
         model = WanI2V(
             config,
@@ -158,8 +159,12 @@ def main() -> None:
             convert_model_dtype=False,
         )
     finally:
-        for component_path in downloaded_shared:
-            component_path.unlink(missing_ok=True)
+        # Keep downloaded files if initialization failed so a retry does not
+        # download the 11+ GiB T5 checkpoint and VAE again. On success, release
+        # disk space before the much larger DiT experts are staged.
+        if model is not None:
+            for component_path in downloaded_shared:
+                component_path.unlink(missing_ok=True)
         gc.collect()
 
     if args.model_dir:
