@@ -480,6 +480,17 @@ class WanI2V:
                 if self.high_noise_model is not None:
                     self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
+            elif getattr(self, "_staged_expert_loading", False):
+                # Staged Kaggle inference keeps only the active DiT expert on
+                # the GPUs during denoising. Release it before VAE decoding,
+                # which needs a large contiguous activation workspace.
+                self.low_noise_model = None
+                self.high_noise_model = None
+                del model
+                gc.collect()
+                for device_index in range(torch.cuda.device_count()):
+                    with torch.cuda.device(device_index):
+                        torch.cuda.empty_cache()
 
             videos = self.vae.decode(x0)
 

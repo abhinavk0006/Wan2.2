@@ -179,6 +179,8 @@ def main() -> None:
         # The upstream loop calls this hook at every denoising step. Keep only
         # the active expert, stream it, and shard whole transformer blocks over
         # both T4s so neither card needs to hold the entire 14B expert.
+        model._staged_expert_loading = True
+
         def prepare_expert(self, t, boundary, offload_model):
             del offload_model
             expert_name = (
