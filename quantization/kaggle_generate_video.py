@@ -95,7 +95,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional local Wan 2.2 I2V model directory with high_noise_model, low_noise_model, T5, and VAE files",
     )
+    parser.add_argument(
+        "--max-area",
+        type=int,
+        default=480 * 832,
+        help="Maximum image area passed to Wan. Lower this for longer shots when activation VRAM is limiting.",
+    )
+    parser.add_argument(
+        "--memory-telemetry",
+        action="store_true",
+        help="Log allocated, reserved, free, and total CUDA memory around major stages.",
+    )
     return parser
+
+
+def log_cuda_memory(label: str) -> None:
+    """Log per-device memory without changing allocation behavior."""
+    for index in range(torch.cuda.device_count()):
+        free, total = torch.cuda.mem_get_info(index)
+        logging.info(
+            "CUDA memory %s gpu=%d allocated=%.2fGiB reserved=%.2fGiB free=%.2fGiB total=%.2fGiB",
+            label,
+            index,
+            torch.cuda.memory_allocated(index) / 2**30,
+            torch.cuda.memory_reserved(index) / 2**30,
+            free / 2**30,
+            total / 2**30,
+        )
 
 
 def main() -> None:
@@ -124,9 +150,13 @@ def main() -> None:
         raise ValueError("Use at least 2 denoising steps so both experts can run.")
     if args.frames < 1 or (args.frames - 1) % 4:
         raise ValueError("Wan frame counts must be 4n+1, for example 17 or 49.")
+    if args.max_area <= 0:
+        raise ValueError("--max-area must be greater than zero.")
 
     torch.cuda.set_device(args.device)
     logging.info("Using %s", torch.cuda.get_device_name(args.device))
+    if args.memory_telemetry:
+        log_cuda_memory("startup")
 
     from wan.configs import WAN_CONFIGS
     from wan.image2video import WanI2V
@@ -260,6 +290,8 @@ def main() -> None:
                         },
                     )
                     logging.info("Expert device map: %s", device_map)
+                    if args.memory_telemetry:
+                        log_cuda_memory(f"after-{expert_name}")
                     torch.cuda.synchronize(self.device)
                     setattr(self, expert_name, expert)
                 finally:
@@ -282,7 +314,7 @@ def main() -> None:
             input_prompt=args.prompt,
             n_prompt=args.negative_prompt,
             img=image.convert("RGB"),
-            max_area=480 * 832,
+            max_area=args.max_area,
             frame_num=args.frames,
             sample_solver="euler" if args.lightning else "unipc",
             sampling_steps=args.steps,
@@ -291,6 +323,8 @@ def main() -> None:
             shift=5.0,
             offload_model=bool(args.model_dir),
         )
+    if args.memory_telemetry:
+        log_cuda_memory("after-generation")
     save_video(
         tensor=video[None],
         save_file=str(args.output),

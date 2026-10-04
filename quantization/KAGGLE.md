@@ -36,6 +36,7 @@ fallback when FlashAttention is unavailable, as on this Kaggle setup.
        --frames 17 \
        --steps 20 \
        --max-memory-gib 8 \
+       --memory-telemetry \
        --output /kaggle/working/wan_i2v_preview.mp4
    ```
 
@@ -66,6 +67,31 @@ adapters, and quantize each expert when it is first activated. Four steps
 reduce denoising work but do not eliminate initial load and conversion costs.
 Laptop checks validate adapter structure and merge math only; the Kaggle run
 is required to validate actual video generation.
+
+## Activation-memory fallback
+
+The default image area is `480 * 832`. For a longer shot that approaches the
+temporary activation limit, try a lower area without changing the model:
+
+```python
+!python quantization/kaggle_generate_video.py \
+    --image /kaggle/input/datasets/abhinavk0006/testimage/1.jpeg \
+    --prompt "A gentle camera push-in; the subject moves naturally." \
+    --lightning \
+    --frames 33 \
+    --gpu0-memory-gib 5 \
+    --gpu1-memory-gib 11 \
+    --max-area 345600 \
+    --memory-telemetry \
+    --output /kaggle/working/wan_i2v_33_low_area.mp4
+```
+
+`--max-area` is an activation-memory experiment, not a guaranteed output
+resolution setting; Wan preserves the input aspect ratio while resizing to the
+requested area. Compare output dimensions and visual detail before adopting
+it for close-up chemistry shots. Telemetry reports per-GPU allocated,
+reserved, free, and total memory after startup, expert dispatch, and
+generation.
 
 4. When the command finishes, the MP4 is at
    `/kaggle/working/wan_i2v_preview.mp4`. Download it from the Kaggle output
