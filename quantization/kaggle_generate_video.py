@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import json
 import logging
 import sys
 from pathlib import Path
@@ -106,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Log allocated, reserved, free, and total CUDA memory around major stages.",
     )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Keep the model loaded and process JSON task objects from stdin.",
+    )
     return parser
 
 
@@ -124,221 +130,207 @@ def log_cuda_memory(label: str) -> None:
         )
 
 
+class WanVideoWorker:
+    """Reusable Wan runtime with staged, one-expert-at-a-time loading."""
+
+    def __init__(self, args: argparse.Namespace, *, daemon: bool = False):
+        self.args = args
+        self._validate_runtime_args()
+        if not torch.cuda.is_available():
+            raise RuntimeError("Enable a Kaggle GPU accelerator before running this script.")
+        if args.device < 0 or args.device >= torch.cuda.device_count():
+            raise ValueError(f"GPU {args.device} is unavailable on this Kaggle session.")
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError("This staged 14B Kaggle path needs two visible GPUs so the expert can be sharded.")
+        torch.cuda.set_device(args.device)
+        logging.info("Using %s", torch.cuda.get_device_name(args.device))
+        if args.memory_telemetry:
+            log_cuda_memory("startup")
+
+        from wan.configs import WAN_CONFIGS
+        from wan.image2video import WanI2V
+        config = copy.deepcopy(WAN_CONFIGS["i2v-A14B"])
+        config.param_dtype = torch.float16
+        config.t5_dtype = torch.bfloat16
+        if args.lightning:
+            config.sample_shift, config.sample_steps = 5.0, 4
+            config.sample_guide_scale = (1.0, 1.0)
+
+        checkpoint_dir = args.model_dir or MODELS_DIR
+        shared = []
+        if args.model_dir:
+            if not args.model_dir.is_dir():
+                raise FileNotFoundError(f"Model directory not found: {args.model_dir}")
+            for component in (config.t5_checkpoint, config.vae_checkpoint):
+                if not (args.model_dir / component).is_file():
+                    raise FileNotFoundError(f"{args.model_dir / component} is missing from --model-dir")
+        else:
+            shared = [download(HF_I2V_REPO, config.t5_checkpoint, MODELS_DIR),
+                      download(HF_I2V_REPO, config.vae_checkpoint, MODELS_DIR)]
+        model = None
+        try:
+            model = WanI2V(config, str(checkpoint_dir), device_id=args.device,
+                           t5_cpu=True, init_on_cpu=True, convert_model_dtype=False)
+        finally:
+            if model is not None:
+                for path in shared:
+                    path.unlink(missing_ok=True)
+            gc.collect()
+        self.config, self.model = config, model
+        model.release_t5_after_encode = not daemon
+        if not args.model_dir:
+            model._staged_expert_loading = True
+            model._wan_worker = self
+            model._prepare_model_for_timestep = MethodType(WanVideoWorker._prepare_expert, model)
+
+    def _validate_runtime_args(self):
+        args = self.args
+        if args.lightning and args.model_dir:
+            raise ValueError("--lightning currently requires the streamed Comfy FP8 checkpoint path; omit --model-dir.")
+        if args.lightning and args.steps not in (4, 20):
+            raise ValueError("The Lightning adapter is distilled for exactly 4 steps; pass --steps 4 or omit --steps.")
+        if args.lightning:
+            args.steps = 4
+        if args.steps < 2:
+            raise ValueError("Use at least 2 denoising steps so both experts can run.")
+        if args.frames < 1 or (args.frames - 1) % 4:
+            raise ValueError("Wan frame counts must be 4n+1, for example 17 or 49.")
+        if args.max_area <= 0:
+            raise ValueError("--max-area must be greater than zero.")
+
+    def _prepare_expert(self, t, boundary, offload_model):
+        del offload_model
+        worker = self._wan_worker
+        args = worker.args
+        expert_name = "high_noise_model" if t.item() >= boundary else "low_noise_model"
+        other_name = "low_noise_model" if expert_name == "high_noise_model" else "high_noise_model"
+        expert = getattr(self, expert_name)
+        if expert is None:
+            other = getattr(self, other_name)
+            if other is not None:
+                setattr(self, other_name, None)
+                del other
+                gc.collect()
+                torch.cuda.empty_cache()
+            checkpoint = download(HF_COMFY_REPO, COMFY_PREFIX + EXPERT_FILES[expert_name], MODELS_DIR)
+            adapter = None
+            try:
+                if args.lightning:
+                    adapter = download(HF_LIGHTNING_REPO,
+                                       f"{LIGHTNING_ADAPTER_DIR}/{expert_name}.safetensors",
+                                       MODELS_DIR / "lightning")
+                from kaggle_single_expert import load_fp8_scaled_wan_checkpoint, dispatch_wan_model_across_gpus
+                logging.info("Converting %s to custom INT8 Linear layers%s", expert_name,
+                             " with merged 4-step Lightning LoRA" if adapter else "")
+                expert, details = load_fp8_scaled_wan_checkpoint(checkpoint, lora_file=adapter)
+                logging.info("Converted %s FP8 tensors; replaced %s Linear layers; merged %s LoRA targets",
+                             details["fp8_scaled_weights_decoded"], details["int8_modules"], details["lora_targets_merged"])
+                gpu_ids = [self.device.index] + [i for i in range(torch.cuda.device_count())
+                                                  if i != self.device.index]
+                expert, device_map = dispatch_wan_model_across_gpus(
+                    expert, gpu_ids, max_memory_gib=args.max_memory_gib,
+                    max_memory_gib_by_device={i: budget for i, budget in
+                                              ((0, args.gpu0_memory_gib), (1, args.gpu1_memory_gib))
+                                              if budget is not None})
+                logging.info("Expert device map: %s", device_map)
+                if args.memory_telemetry:
+                    log_cuda_memory(f"after-{expert_name}")
+                torch.cuda.synchronize(self.device)
+                setattr(self, expert_name, expert)
+            finally:
+                checkpoint.unlink(missing_ok=True)
+                if adapter is not None:
+                    adapter.unlink(missing_ok=True)
+                gc.collect()
+            logging.info("Loaded %s on %s", expert_name, self.device)
+        return getattr(self, expert_name)
+
+    def cleanup(self):
+        if self.args.model_dir:
+            return
+        for name in ("high_noise_model", "low_noise_model"):
+            expert = getattr(self.model, name, None)
+            if expert is not None:
+                setattr(self.model, name, None)
+                del expert
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def generate(self, task: dict) -> Path:
+        args = copy.copy(self.args)
+        for key in ("image", "prompt", "negative_prompt", "output", "steps", "frames", "seed", "max_area"):
+            if key in task:
+                setattr(args, key, task[key])
+        args.image, args.output = Path(args.image), Path(args.output)
+        if not args.image.is_file():
+            raise FileNotFoundError(f"Input image not found: {args.image}")
+        if args.frames < 1 or (args.frames - 1) % 4:
+            raise ValueError("Wan frame counts must be 4n+1, for example 17 or 49.")
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(args.image) as image:
+            video = self.model.generate(input_prompt=args.prompt, n_prompt=args.negative_prompt,
+                img=image.convert("RGB"), max_area=args.max_area, frame_num=args.frames,
+                sample_solver="euler" if args.lightning else "unipc", sampling_steps=args.steps,
+                guide_scale=(1.0, 1.0) if args.lightning else (3.5, 3.5),
+                seed=args.seed, shift=5.0, offload_model=bool(args.model_dir))
+        if args.memory_telemetry:
+            log_cuda_memory("after-generation")
+        from wan.utils.utils import save_video
+        save_video(tensor=video[None], save_file=str(args.output), fps=self.config.sample_fps,
+                   nrow=1, normalize=True, value_range=(-1, 1))
+        del video
+        self.cleanup()
+        if not args.output.is_file() or args.output.stat().st_size == 0:
+            raise RuntimeError(f"Video writer did not produce a non-empty file at {args.output}")
+        return args.output
+
+
+def run_daemon(args: argparse.Namespace) -> int:
+    try:
+        worker = WanVideoWorker(args, daemon=True)
+    except Exception as error:
+        logging.exception("Daemon initialization failed")
+        print(json.dumps({"event": "ERROR", "error": str(error),
+                          "type": type(error).__name__}), flush=True)
+        return 1
+    print(json.dumps({"event": "READY", "protocol": 1}), flush=True)
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            task = json.loads(line)
+            if not isinstance(task, dict):
+                raise ValueError("Each daemon input line must be a JSON object.")
+            if task.get("op") == "exit":
+                print(json.dumps({"event": "EXITING"}), flush=True)
+                worker.cleanup()
+                return 0
+            output = worker.generate(task)
+            print(json.dumps({"ok": True, "output": str(output)}), flush=True)
+        except Exception as error:
+            logging.exception("Daemon task failed")
+            print(json.dumps({"ok": False, "error": str(error),
+                              "type": type(error).__name__}), flush=True)
+        finally:
+            # Also release a partially loaded expert when generation fails.
+            worker.cleanup()
+    worker.cleanup()
+    return 0
+
+
 def main() -> None:
     args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
+    if args.daemon:
+        raise SystemExit(run_daemon(args))
     if not torch.cuda.is_available():
         raise RuntimeError("Enable a Kaggle GPU accelerator before running this script.")
-    if args.device < 0 or args.device >= torch.cuda.device_count():
-        raise ValueError(f"GPU {args.device} is unavailable on this Kaggle session.")
-    if torch.cuda.device_count() < 2:
-        raise RuntimeError(
-            "This staged 14B Kaggle path needs two visible GPUs so the expert can be sharded."
-        )
     if not args.image.is_file():
         raise FileNotFoundError(
             f"Input image not found: {args.image}. Upload an image as a Kaggle input and pass --image /kaggle/input/.../your_image.png"
         )
-    if args.lightning and args.model_dir:
-        raise ValueError("--lightning currently requires the streamed Comfy FP8 checkpoint path; omit --model-dir.")
-    if args.lightning and args.steps not in (4, 20):
-        raise ValueError("The Lightning adapter is distilled for exactly 4 steps; pass --steps 4 or omit --steps.")
-    if args.lightning:
-        args.steps = 4
-    if args.steps < 2:
-        raise ValueError("Use at least 2 denoising steps so both experts can run.")
-    if args.frames < 1 or (args.frames - 1) % 4:
-        raise ValueError("Wan frame counts must be 4n+1, for example 17 or 49.")
-    if args.max_area <= 0:
-        raise ValueError("--max-area must be greater than zero.")
-
-    torch.cuda.set_device(args.device)
-    logging.info("Using %s", torch.cuda.get_device_name(args.device))
-    if args.memory_telemetry:
-        log_cuda_memory("startup")
-
-    from wan.configs import WAN_CONFIGS
-    from wan.image2video import WanI2V
-    from wan.utils.utils import save_video
-
-    config = copy.deepcopy(WAN_CONFIGS["i2v-A14B"])
-    config.param_dtype = torch.float16
-    config.t5_dtype = torch.bfloat16
-    if args.lightning:
-        config.sample_shift = 5.0
-        config.sample_steps = 4
-        config.sample_guide_scale = (1.0, 1.0)
-
-    # The local-directory path is for a compatible full checkpoint prepared
-    # elsewhere. The default path stages Comfy FP8 experts from Hugging Face.
-    checkpoint_dir = args.model_dir or MODELS_DIR
-    downloaded_shared = []
-    if args.model_dir:
-        if not args.model_dir.is_dir():
-            raise FileNotFoundError(f"Model directory not found: {args.model_dir}")
-        for component in (config.t5_checkpoint, config.vae_checkpoint):
-            if not (args.model_dir / component).is_file():
-                raise FileNotFoundError(
-                    f"{args.model_dir / component} is missing from --model-dir"
-                )
-    else:
-        downloaded_shared = [
-            download(HF_I2V_REPO, config.t5_checkpoint, MODELS_DIR),
-            download(HF_I2V_REPO, config.vae_checkpoint, MODELS_DIR),
-        ]
-
-    model = None
-    try:
-        model = WanI2V(
-            config,
-            str(checkpoint_dir),
-            device_id=args.device,
-            t5_cpu=True,
-            init_on_cpu=True,
-            convert_model_dtype=False,
-        )
-    finally:
-        # Keep downloaded files if initialization failed so a retry does not
-        # download the 11+ GiB T5 checkpoint and VAE again. On success, release
-        # disk space before the much larger DiT experts are staged.
-        if model is not None:
-            for component_path in downloaded_shared:
-                component_path.unlink(missing_ok=True)
-        gc.collect()
-
-    # This script generates one video per process. Release the 11+ GiB CPU T5
-    # weights after prompt encoding, before streaming either 14B DiT expert.
-    model.release_t5_after_encode = True
-
-    if args.model_dir:
-        # The upstream method loads both experts from Diffusers folders and
-        # offloads inactive weights to CPU. This supports a full prepared pair.
-        pass
-    else:
-        # The upstream loop calls this hook at every denoising step. Keep only
-        # the active expert, stream it, and shard whole transformer blocks over
-        # both T4s so neither card needs to hold the entire 14B expert.
-        model._staged_expert_loading = True
-
-        def prepare_expert(self, t, boundary, offload_model):
-            del offload_model
-            expert_name = (
-                "high_noise_model" if t.item() >= boundary else "low_noise_model"
-            )
-            other_name = (
-                "low_noise_model"
-                if expert_name == "high_noise_model"
-                else "high_noise_model"
-            )
-            expert = getattr(self, expert_name)
-            if expert is None:
-                other = getattr(self, other_name)
-                if other is not None:
-                    setattr(self, other_name, None)
-                    del other
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                checkpoint = download(
-                    HF_COMFY_REPO,
-                    COMFY_PREFIX + EXPERT_FILES[expert_name],
-                    MODELS_DIR,
-                )
-                adapter = None
-                try:
-                    if args.lightning:
-                        adapter_filename = f"{expert_name}.safetensors"
-                        adapter = download(
-                            HF_LIGHTNING_REPO,
-                            f"{LIGHTNING_ADAPTER_DIR}/{adapter_filename}",
-                            MODELS_DIR / "lightning",
-                        )
-                    from kaggle_single_expert import load_fp8_scaled_wan_checkpoint
-                    from kaggle_single_expert import dispatch_wan_model_across_gpus
-
-                    logging.info(
-                        "Converting %s to custom INT8 Linear layers%s",
-                        expert_name,
-                        " with merged 4-step Lightning LoRA" if adapter else "",
-                    )
-                    expert, details = load_fp8_scaled_wan_checkpoint(
-                        checkpoint, lora_file=adapter
-                    )
-                    logging.info(
-                        "Converted %s FP8 tensors; replaced %s Linear layers; merged %s LoRA targets",
-                        details["fp8_scaled_weights_decoded"],
-                        details["int8_modules"],
-                        details["lora_targets_merged"],
-                    )
-                    gpu_ids = [self.device.index] + [
-                        index
-                        for index in range(torch.cuda.device_count())
-                        if index != self.device.index
-                    ]
-                    expert, device_map = dispatch_wan_model_across_gpus(
-                        expert,
-                        gpu_ids,
-                        max_memory_gib=args.max_memory_gib,
-                        max_memory_gib_by_device={
-                            device_id: budget
-                            for device_id, budget in (
-                                (0, args.gpu0_memory_gib),
-                                (1, args.gpu1_memory_gib),
-                            )
-                            if budget is not None
-                        },
-                    )
-                    logging.info("Expert device map: %s", device_map)
-                    if args.memory_telemetry:
-                        log_cuda_memory(f"after-{expert_name}")
-                    torch.cuda.synchronize(self.device)
-                    setattr(self, expert_name, expert)
-                finally:
-                    checkpoint.unlink(missing_ok=True)
-                    if adapter is not None:
-                        adapter.unlink(missing_ok=True)
-                    gc.collect()
-                logging.info("Loaded %s on %s", expert_name, self.device)
-            return getattr(self, expert_name)
-
-        model._prepare_model_for_timestep = MethodType(prepare_expert, model)
-
-        # WanI2V.generate() moves both experts to CPU at the end when
-        # offload_model=True. In staged mode one field is None, so use the normal
-        # path with offloading disabled and let the cleanup below release CUDA.
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with Image.open(args.image) as image:
-        video = model.generate(
-            input_prompt=args.prompt,
-            n_prompt=args.negative_prompt,
-            img=image.convert("RGB"),
-            max_area=args.max_area,
-            frame_num=args.frames,
-            sample_solver="euler" if args.lightning else "unipc",
-            sampling_steps=args.steps,
-            guide_scale=(1.0, 1.0) if args.lightning else (3.5, 3.5),
-            seed=args.seed,
-            shift=5.0,
-            offload_model=bool(args.model_dir),
-        )
-    if args.memory_telemetry:
-        log_cuda_memory("after-generation")
-    save_video(
-        tensor=video[None],
-        save_file=str(args.output),
-        fps=config.sample_fps,
-        nrow=1,
-        normalize=True,
-        value_range=(-1, 1),
-    )
-    if not args.output.is_file() or args.output.stat().st_size == 0:
-        raise RuntimeError(f"Video writer did not produce a non-empty file at {args.output}")
-    print(f"Video saved: {args.output}")
-    del video, model
-    gc.collect()
-    torch.cuda.empty_cache()
+    output = WanVideoWorker(args).generate({})
+    print(f"Video saved: {output}")
 
 
 if __name__ == "__main__":

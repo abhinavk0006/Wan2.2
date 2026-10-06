@@ -93,6 +93,30 @@ it for close-up chemistry shots. Telemetry reports per-GPU allocated,
 reserved, free, and total memory after startup, expert dispatch, and
 generation.
 
+## Persistent JSON-lines worker
+
+For pipelines that render several clips, opt into the persistent worker. It
+loads T5/VAE and the Wan runtime once, then processes tasks sequentially.
+High- and low-noise experts are still streamed and released between tasks;
+both 14B experts are never intentionally resident at the same time.
+
+```python
+%cd /kaggle/working/Wan2.2
+!python quantization/kaggle_generate_video.py --daemon \
+    --max-memory-gib 8 --frames 17 --steps 20 <<'TASKS'
+{"image":"/kaggle/input/datasets/abhinavk0006/testimage/1.jpeg","prompt":"A gentle camera push-in.","output":"/kaggle/working/clip-1.mp4","seed":1}
+{"image":"/kaggle/input/datasets/abhinavk0006/testimage/1.jpeg","prompt":"A slow natural movement.","output":"/kaggle/working/clip-2.mp4","seed":2}
+{"op":"exit"}
+TASKS
+```
+
+The first stdout line is `{"event":"READY","protocol":1}`. Each subsequent
+task produces one response: success is `{"ok":true,"output":"..."}` and a
+task error is `{"ok":false,"error":"...","type":"..."}`; errors do not stop
+the worker. `{"op":"exit"}` produces `{"event":"EXITING"}` and cleanly exits.
+Blank lines are ignored and EOF also exits cleanly. Logs are written to
+stderr, so stdout remains machine-readable.
+
 4. When the command finishes, the MP4 is at
    `/kaggle/working/wan_i2v_preview.mp4`. Download it from the Kaggle output
    pane or copy it into a Kaggle dataset for reuse.
