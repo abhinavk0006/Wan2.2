@@ -2,10 +2,13 @@
 
 import argparse
 import ast
+import io
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from kaggle_generate_video import WanVideoWorker, build_parser
+import kaggle_generate_video
+from kaggle_generate_video import WanVideoWorker, build_parser, normalize_daemon_task
 
 
 class KaggleRunnerTests(unittest.TestCase):
@@ -40,6 +43,42 @@ class KaggleRunnerTests(unittest.TestCase):
         source = Path(__file__).with_name("kaggle_generate_video.py").read_text()
         for field in ("input_image", "output_video", "clip_duration", "clip_name"):
             self.assertIn(field, source)
+
+    def test_task_parsing_matches_wrapper_and_derives_seed(self):
+        task = normalize_daemon_task({
+            "input_image": "in.png", "output_video": "out.mp4",
+            "prompt": "move", "clip_duration": 1.0, "clip_name": "clip-1",
+        })
+        self.assertEqual(task["frames"], 17)
+        self.assertIsInstance(task["seed"], int)
+        self.assertEqual(task["image"], "in.png")
+
+    def test_daemon_retains_state_until_exit(self):
+        class FakeWorker:
+            cleanups = 0
+            generations = 0
+
+            def __init__(self, args, daemon=False):
+                pass
+
+            def generate(self, task):
+                type(self).generations += 1
+
+            def cleanup(self):
+                type(self).cleanups += 1
+
+        stdin = io.StringIO(
+            '{"input_image":"in.png","output_video":"a.mp4","prompt":"a"}\n'
+            '{"input_image":"in.png","output_video":"b.mp4","prompt":"b"}\n'
+            '{"action":"exit"}\n'
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(kaggle_generate_video, "WanVideoWorker", FakeWorker), \
+             mock.patch.object(kaggle_generate_video.sys, "stdin", stdin), \
+             mock.patch.object(kaggle_generate_video.sys, "stdout", stdout):
+            self.assertEqual(kaggle_generate_video.run_daemon(object()), 0)
+        self.assertEqual(FakeWorker.generations, 2)
+        self.assertEqual(FakeWorker.cleanups, 1)
 
 
 if __name__ == "__main__":

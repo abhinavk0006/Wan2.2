@@ -132,6 +132,38 @@ def log_cuda_memory(label: str) -> None:
         )
 
 
+def normalize_daemon_task(task: dict, *, sample_fps: int = 16) -> dict:
+    """Validate and normalize the wrapper-compatible JSON task fields."""
+    required = ("input_image", "output_video", "prompt")
+    missing = [key for key in required if not str(task.get(key, "")).strip()]
+    if missing:
+        raise ValueError(f"Missing daemon task field(s): {', '.join(missing)}")
+    normalized = {
+        "image": task["input_image"],
+        "output": task["output_video"],
+        "prompt": task["prompt"],
+        "negative_prompt": task.get("negative_prompt", ""),
+    }
+    if "frames" in task:
+        normalized["frames"] = int(task["frames"])
+    elif "clip_duration" in task:
+        duration = float(task["clip_duration"])
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("clip_duration must be a finite number greater than zero")
+        normalized["frames"] = max(17, 4 * math.ceil((duration * sample_fps - 1) / 4) + 1)
+    if "seed" in task:
+        normalized["seed"] = int(task["seed"])
+    elif task.get("clip_name"):
+        normalized["seed"] = int.from_bytes(
+            hashlib.sha256(str(task["clip_name"]).encode("utf-8")).digest()[:4],
+            "big",
+        )
+    for key in ("steps", "max_area"):
+        if key in task:
+            normalized[key] = task[key]
+    return normalized
+
+
 class WanVideoWorker:
     """Reusable Wan runtime with staged, one-expert-at-a-time loading."""
 
@@ -260,32 +292,9 @@ class WanVideoWorker:
 
     def generate(self, task: dict) -> Path:
         args = copy.copy(self.args)
-        required = ("input_image", "output_video", "prompt")
-        missing = [key for key in required if not str(task.get(key, "")).strip()]
-        if missing:
-            raise ValueError(f"Missing daemon task field(s): {', '.join(missing)}")
-        args.image = task["input_image"]
-        args.output = task["output_video"]
-        args.prompt = task["prompt"]
-        args.negative_prompt = task.get("negative_prompt", "")
-        if "frames" in task:
-            args.frames = int(task["frames"])
-        elif "clip_duration" in task:
-            duration = float(task["clip_duration"])
-            if not math.isfinite(duration) or duration <= 0:
-                raise ValueError("clip_duration must be a finite number greater than zero")
-            raw_frames = duration * self.config.sample_fps
-            args.frames = max(17, 4 * math.ceil((raw_frames - 1) / 4) + 1)
-        if "seed" in task:
-            args.seed = int(task["seed"])
-        elif task.get("clip_name"):
-            args.seed = int.from_bytes(
-                hashlib.sha256(str(task["clip_name"]).encode("utf-8")).digest()[:4],
-                "big",
-            )
-        for key in ("steps", "max_area"):
-            if key in task:
-                setattr(args, key, task[key])
+        normalized = normalize_daemon_task(task, sample_fps=self.config.sample_fps)
+        for key, value in normalized.items():
+            setattr(args, key, value)
         args.image, args.output = Path(args.image), Path(args.output)
         if not args.image.is_file():
             raise FileNotFoundError(f"Input image not found: {args.image}")
@@ -304,7 +313,6 @@ class WanVideoWorker:
         save_video(tensor=video[None], save_file=str(args.output), fps=self.config.sample_fps,
                    nrow=1, normalize=True, value_range=(-1, 1))
         del video
-        self.cleanup()
         if not args.output.is_file() or args.output.stat().st_size == 0:
             raise RuntimeError(f"Video writer did not produce a non-empty file at {args.output}")
         return args.output
@@ -318,27 +326,26 @@ def run_daemon(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "error", "error": str(error)}), flush=True)
         return 1
     print("READY", flush=True)
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            task = json.loads(line)
-            if not isinstance(task, dict):
-                raise ValueError("Each daemon input line must be a JSON object.")
-            if task.get("action") == "exit" or task.get("op") == "exit":
-                worker.cleanup()
-                return 0
-            output = worker.generate(task)
-            del output
-            print(json.dumps({"status": "success"}), flush=True)
-        except Exception as error:
-            logging.exception("Daemon task failed")
-            print(json.dumps({"status": "error", "error": str(error)}), flush=True)
-        finally:
-            # Also release a partially loaded expert when generation fails.
-            worker.cleanup()
-    worker.cleanup()
-    return 0
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                task = json.loads(line)
+                if not isinstance(task, dict):
+                    raise ValueError("Each daemon input line must be a JSON object.")
+                if task.get("action") == "exit" or task.get("op") == "exit":
+                    return 0
+                worker.generate(task)
+                print(json.dumps({"status": "success"}), flush=True)
+            except Exception as error:
+                logging.exception("Daemon task failed")
+                print(json.dumps({"status": "error", "error": str(error)}), flush=True)
+        return 0
+    finally:
+        # Keep T5/VAE and the last staged expert resident between tasks. Only
+        # process termination or an explicit exit releases CUDA allocations.
+        worker.cleanup()
 
 
 def main() -> None:
@@ -352,7 +359,18 @@ def main() -> None:
         raise FileNotFoundError(
             f"Input image not found: {args.image}. Upload an image as a Kaggle input and pass --image /kaggle/input/.../your_image.png"
         )
-    output = WanVideoWorker(args).generate({})
+    worker = WanVideoWorker(args)
+    try:
+        output = worker.generate({
+            "input_image": args.image,
+            "output_video": args.output,
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+            "frames": args.frames,
+            "seed": args.seed,
+        })
+    finally:
+        worker.cleanup()
     print(f"Video saved: {output}")
 
 

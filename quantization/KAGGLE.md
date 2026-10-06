@@ -98,7 +98,13 @@ generation.
 For pipelines that render several clips, opt into the persistent worker. It
 loads T5/VAE and the Wan runtime once, then processes tasks sequentially.
 High- and low-noise experts are still streamed and released between tasks;
-both 14B experts are never intentionally resident at the same time.
+both 14B experts are never intentionally resident at the same time. The
+daemon deliberately does **not** run expert cleanup after each task: T5/VAE
+and whichever expert was last staged remain resident for reuse. On a typical
+run the final low-noise expert remains on the T4s, so the next task can reuse
+that state; switching noise phases still evicts it before loading the other
+expert. This is the best VRAM-safe tradeoff without keeping both 14B experts
+resident. Exit/EOF releases the staged expert and CUDA allocations.
 
 ```python
 %cd /kaggle/working/Wan2.2
@@ -112,7 +118,7 @@ TASKS
 
 The first stdout line is `READY`. Each subsequent task produces one JSON
 response: `{"status":"success"}` or `{"status":"error","error":"..."}`;
-errors do not stop the worker. Tasks use the existing wrapper fields
+errors do not stop the worker or discard reusable model state. Tasks use the existing wrapper fields
 `input_image`, `output_video`, `prompt`, `negative_prompt`, `clip_duration`
 (or `frames`), and optional `clip_name`/`seed`. `{"action":"exit"}` cleanly
 exits. Blank lines are ignored and EOF also exits cleanly. Logs are written
