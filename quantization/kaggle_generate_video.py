@@ -39,6 +39,14 @@ EXPERT_FILES = {
     "high_noise_model": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
     "low_noise_model": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
 }
+DAEMON_CUDA_OOM_EXIT_CODE = 75
+
+
+class WanCudaOOMError(RuntimeError):
+    """Fatal worker error carrying diagnostics for the parent pipeline."""
+
+    error_type = "cuda_oom"
+    exit_code = DAEMON_CUDA_OOM_EXIT_CODE
 
 
 def cuda_oom_diagnostics(error: BaseException) -> str:
@@ -63,7 +71,7 @@ def cuda_oom_diagnostics(error: BaseException) -> str:
 
 def raise_cuda_oom(error: BaseException) -> None:
     if isinstance(error, torch.cuda.OutOfMemoryError):
-        raise RuntimeError(cuda_oom_diagnostics(error)) from error
+        raise WanCudaOOMError(cuda_oom_diagnostics(error)) from error
     raise error
 
 
@@ -408,15 +416,19 @@ def run_daemon(args: argparse.Namespace) -> int:
         worker = WanVideoWorker(args, daemon=True)
     except Exception as error:
         logging.exception("Daemon initialization failed")
-        print(json.dumps({
+        response = {
             "status": "error",
             "error": (
                 cuda_oom_diagnostics(error)
                 if isinstance(error, torch.cuda.OutOfMemoryError)
                 else str(error)
             ),
-        }), flush=True)
-        return 1
+        }
+        if isinstance(error, torch.cuda.OutOfMemoryError):
+            response.update(error_type="cuda_oom", fatal=True)
+        print(json.dumps(response), flush=True)
+        sys.stderr.flush()
+        return DAEMON_CUDA_OOM_EXIT_CODE if response.get("error_type") else 1
     print("READY", flush=True)
     try:
         for line in sys.stdin:
@@ -444,21 +456,33 @@ def run_daemon(args: argparse.Namespace) -> int:
                 print(json.dumps(response), flush=True)
             except Exception as error:
                 logging.exception("Daemon task failed")
-                response = {"status": "error", "error": (
-                    cuda_oom_diagnostics(error)
-                    if isinstance(error, torch.cuda.OutOfMemoryError)
-                    else str(error)
-                )}
+                is_oom = isinstance(error, (WanCudaOOMError, torch.cuda.OutOfMemoryError))
+                response = {
+                    "status": "error",
+                    "error": (
+                        str(error) if isinstance(error, WanCudaOOMError)
+                        else cuda_oom_diagnostics(error)
+                        if is_oom
+                        else str(error)
+                    ),
+                }
+                if is_oom:
+                    response.update(error_type="cuda_oom", fatal=True)
                 if isinstance(task, dict):
                     request_id = task.get("request_id", task.get("id"))
                     if request_id is not None:
                         response["request_id"] = request_id
                 print(json.dumps(response), flush=True)
+                if is_oom:
+                    sys.stderr.write(f"Wan daemon CUDA OOM: {response['error']}\n")
+                    sys.stderr.flush()
+                    return DAEMON_CUDA_OOM_EXIT_CODE
         return 0
     finally:
         # Keep T5/VAE and the last staged expert resident between tasks. Only
         # process termination or an explicit exit releases CUDA allocations.
         worker.cleanup()
+        sys.stderr.flush()
 
 
 def main() -> None:

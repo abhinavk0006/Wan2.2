@@ -128,6 +128,12 @@ shutdown acknowledgement. Unsupported actions and malformed task fields
 produce explicit error responses. Blank lines are ignored and EOF also exits
 cleanly. Logs are written to stderr, so stdout remains machine-readable.
 
+A CUDA OOM during a task is the intentional exception: the response includes
+`"error_type":"cuda_oom"` and `"fatal":true`, includes the request ID when
+provided, and is flushed before the daemon exits with status `75`. The same
+typed response and exit status are used for an OOM during daemon startup.
+Ordinary task errors remain recoverable and continue serving later tasks.
+
 4. When the command finishes, the MP4 is at
    `/kaggle/working/wan_i2v_preview.mp4`. Download it from the Kaggle output
    pane or copy it into a Kaggle dataset for reuse.

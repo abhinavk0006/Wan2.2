@@ -9,7 +9,9 @@ from pathlib import Path
 
 import kaggle_generate_video
 from kaggle_generate_video import (
+    DAEMON_CUDA_OOM_EXIT_CODE,
     WanVideoWorker,
+    WanCudaOOMError,
     build_parser,
     cuda_oom_diagnostics,
     normalize_daemon_task,
@@ -133,6 +135,36 @@ class KaggleRunnerTests(unittest.TestCase):
             self.assertEqual(kaggle_generate_video.run_daemon(object()), 0)
         self.assertIn('"request_id": "clip-1"', stdout.getvalue())
         self.assertIn('"request_id": "stop-1"', stdout.getvalue())
+
+    def test_daemon_marks_cuda_oom_fatal_and_returns_distinct_exit_code(self):
+        class FakeWorker:
+            def __init__(self, args, daemon=False):
+                pass
+
+            def generate(self, task):
+                raise WanCudaOOMError("CUDA out of memory during test")
+
+            def cleanup(self):
+                pass
+
+        stdin = io.StringIO(
+            '{"request_id":"clip-oom","input_image":"in.png",'
+            '"output_video":"a.mp4","prompt":"a"}\n'
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(kaggle_generate_video, "WanVideoWorker", FakeWorker), \
+             mock.patch.object(kaggle_generate_video.sys, "stdin", stdin), \
+             mock.patch.object(kaggle_generate_video.sys, "stdout", stdout), \
+             mock.patch.object(kaggle_generate_video.sys, "stderr", stderr):
+            self.assertEqual(
+                kaggle_generate_video.run_daemon(object()),
+                DAEMON_CUDA_OOM_EXIT_CODE,
+            )
+        self.assertIn('"error_type": "cuda_oom"', stdout.getvalue())
+        self.assertIn('"fatal": true', stdout.getvalue())
+        self.assertIn('"request_id": "clip-oom"', stdout.getvalue())
+        self.assertIn("Wan daemon CUDA OOM", stderr.getvalue())
 
 
 if __name__ == "__main__":
