@@ -8,7 +8,12 @@ from unittest import mock
 from pathlib import Path
 
 import kaggle_generate_video
-from kaggle_generate_video import WanVideoWorker, build_parser, normalize_daemon_task
+from kaggle_generate_video import (
+    WanVideoWorker,
+    build_parser,
+    cuda_oom_diagnostics,
+    normalize_daemon_task,
+)
 
 
 class KaggleRunnerTests(unittest.TestCase):
@@ -21,6 +26,19 @@ class KaggleRunnerTests(unittest.TestCase):
         self.assertTrue(args.daemon)
         self.assertEqual(args.frames, 17)
         self.assertEqual(args.steps, 20)
+
+    def test_asymmetric_gpu_budget_flags_are_parsed(self):
+        args = build_parser().parse_args([
+            "--gpu0-memory-gib", "5", "--gpu1-memory-gib", "11",
+        ])
+        self.assertEqual(args.gpu0_memory_gib, 5)
+        self.assertEqual(args.gpu1_memory_gib, 11)
+
+    def test_cuda_oom_diagnostics_are_explicit_without_cuda(self):
+        with mock.patch.object(kaggle_generate_video.torch.cuda, "is_available", return_value=False):
+            message = cuda_oom_diagnostics(RuntimeError("allocation failed"))
+        self.assertIn("CUDA out of memory during Wan2.2 generation", message)
+        self.assertIn("allocation failed", message)
 
     def test_runtime_validation_is_cuda_free(self):
         args = argparse.Namespace(

@@ -148,7 +148,20 @@ generating a video, test one expert across both visible GPUs with:
 The custom Linear implementation still expands weights during every forward
 pass, so two-GPU inference remains experimental and may be slow. The custom
 loader accepts the Comfy Wan FP8-scaled key layout with scalar per-tensor
-scales; unsupported formats stop with an error.
+scales; unsupported formats stop with an error. The expert dispatcher assigns
+each Wan transformer block with a capacity-normalized balance pass, so an
+asymmetric budget such as `--gpu0-memory-gib 5 --gpu1-memory-gib 11` does not
+automatically pack all blocks onto GPU 1. Each requested budget is a hard
+storage ceiling; keep at least 1--2 GiB of additional headroom for attention
+and INT8 dequantization workspaces.
+
+For the streamed Kaggle path, the VAE is explicitly moved to CPU after image
+encoding, while the active expert is denoising, and restored to the selected
+GPU only after the expert is released for decoding. This is enabled only for
+the streamed path; local `--model-dir` runs retain the original VAE residency
+behavior. If a CUDA allocation fails, the daemon returns an error containing
+allocated, reserved, free, total, and peak memory for every visible GPU;
+check that diagnostic before changing model or resolution settings.
 
 The separate `kaggle_single_expert.py` command remains available for loading
 and smoke-testing one expert. It does not generate a video.

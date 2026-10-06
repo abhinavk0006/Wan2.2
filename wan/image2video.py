@@ -80,6 +80,10 @@ class WanI2V:
         # Optional for one-shot, memory-constrained generation: once both
         # prompts are encoded, the large CPU T5 weights are no longer needed.
         self.release_t5_after_encode = False
+        # Staged Kaggle inference can keep the VAE off GPU while DiT experts
+        # are active, then restore it for decoding. Disabled by default to
+        # preserve the original latency and persistent-runtime behavior.
+        self.vae_cpu_offload = False
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -127,6 +131,15 @@ class WanI2V:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+
+    def _set_vae_device(self, device):
+        """Move the VAE and its normalization tensors as one unit."""
+        device = torch.device(device)
+        self.vae.model.to(device)
+        self.vae.mean = self.vae.mean.to(device)
+        self.vae.std = self.vae.std.to(device)
+        self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+        self.vae.device = device
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -360,6 +373,10 @@ class WanI2V:
                          dim=1).to(self.device)
         ])[0]
         y = torch.concat([msk, y])
+        if self.vae_cpu_offload:
+            self._set_vae_device("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
 
         @contextmanager
         def noop_no_sync():
@@ -492,6 +509,10 @@ class WanI2V:
                     with torch.cuda.device(device_index):
                         torch.cuda.empty_cache()
 
+            if self.vae_cpu_offload:
+                self._set_vae_device(self.device)
+                x0 = [latent.to(self.device)]
+                torch.cuda.empty_cache()
             videos = self.vae.decode(x0)
 
         del noise, latent, x0

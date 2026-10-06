@@ -381,23 +381,63 @@ def dispatch_wan_model_across_gpus(
         raise ValueError(f"Invalid CUDA device list: {gpu_ids}")
 
     try:
-        from accelerate import dispatch_model, infer_auto_device_map
+        from accelerate import dispatch_model
     except ImportError as exc:
         raise RuntimeError("Multi-GPU placement needs accelerate.") from exc
 
-    max_memory = {}
+    budgets = {}
     for device_id in gpu_ids:
         budget = (max_memory_gib_by_device or {}).get(device_id, max_memory_gib)
         if budget <= 0:
             raise ValueError(f"GPU {device_id} memory budget must be positive, got {budget} GiB")
-        max_memory[device_id] = f"{budget:g}GiB"
-    device_map = infer_auto_device_map(
-        model,
-        max_memory=max_memory,
-        no_split_module_classes=["WanAttentionBlock"],
-        dtype=torch.float16,
-        clean_result=True,
-    )
+        budgets[device_id] = int(budget * 2**30)
+
+    # Accelerate's size-based auto mapper fills devices in order. With the
+    # asymmetric budgets used on two T4s that can leave the larger-budget
+    # device carrying nearly all blocks and no activation headroom. Wan's
+    # direct children are safe placement boundaries, so assign them with a
+    # normalized-capacity greedy pass instead. This keeps every device below
+    # its requested storage ceiling while balancing blocks by budget.
+    children = list(model.named_children())
+    if not children:
+        raise ValueError("Wan model has no child modules to shard.")
+    units = []
+    for name, child in children:
+        if name == "blocks":
+            units.extend(
+                (f"{name}.{block_name}", block)
+                for block_name, block in child.named_children()
+            )
+        else:
+            units.append((name, child))
+    loads = {device_id: 0 for device_id in gpu_ids}
+    device_map = {}
+    for name, child in units:
+        size = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in list(child.parameters()) + list(child.buffers())
+        )
+        candidates = sorted(
+            gpu_ids,
+            key=lambda device_id: (
+                loads[device_id] / budgets[device_id],
+                loads[device_id],
+            ),
+        )
+        selected = next(
+            (device_id for device_id in candidates
+             if loads[device_id] + size <= budgets[device_id]),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(
+                "Wan model does not fit within the requested per-GPU memory "
+                f"budgets without CPU/disk offload: module={name!r}, "
+                f"module_bytes={size}, loads={loads}, budgets={budgets}"
+            )
+        device_map[name] = selected
+        loads[selected] += size
+
     assigned_devices = set(device_map.values())
     allowed_devices = set(gpu_ids)
     if not assigned_devices.issubset(allowed_devices):
@@ -406,7 +446,7 @@ def dispatch_wan_model_across_gpus(
             f"without CPU/disk offload: {device_map}"
         )
 
-    logging.info("Dispatching Wan blocks over CUDA devices: %s", device_map)
+    logging.info("Dispatching Wan modules over CUDA devices: %s (bytes=%s)", device_map, loads)
     model = dispatch_model(model, device_map=device_map, main_device=gpu_ids[0])
     return model, {str(module): device for module, device in device_map.items()}
 

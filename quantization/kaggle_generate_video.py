@@ -41,6 +41,32 @@ EXPERT_FILES = {
 }
 
 
+def cuda_oom_diagnostics(error: BaseException) -> str:
+    """Return actionable per-GPU state for a CUDA allocation failure."""
+    details = [f"{type(error).__name__}: {error}"]
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(index)
+            details.append(
+                "gpu=%d allocated=%.2fGiB reserved=%.2fGiB free=%.2fGiB total=%.2fGiB peak=%.2fGiB"
+                % (
+                    index,
+                    torch.cuda.memory_allocated(index) / 2**30,
+                    torch.cuda.memory_reserved(index) / 2**30,
+                    free / 2**30,
+                    total / 2**30,
+                    torch.cuda.max_memory_allocated(index) / 2**30,
+                )
+            )
+    return "CUDA out of memory during Wan2.2 generation; " + "; ".join(details)
+
+
+def raise_cuda_oom(error: BaseException) -> None:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        raise RuntimeError(cuda_oom_diagnostics(error)) from error
+    raise error
+
+
 def download(repo_id: str, filename: str, destination_dir: Path) -> Path:
     from huggingface_hub import hf_hub_download
 
@@ -229,6 +255,7 @@ class WanVideoWorker:
             gc.collect()
         self.config, self.model = config, model
         model.release_t5_after_encode = not daemon
+        model.vae_cpu_offload = not bool(args.model_dir)
         self._t5_checkpoint = checkpoint_dir / config.t5_checkpoint
         self._t5_tokenizer_path = config.t5_tokenizer
         self._t5_released_for_expert_swap = False
@@ -356,12 +383,15 @@ class WanVideoWorker:
         if args.frames < 1 or (args.frames - 1) % 4:
             raise ValueError("Wan frame counts must be 4n+1, for example 17 or 49.")
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        with Image.open(args.image) as image:
-            video = self.model.generate(input_prompt=args.prompt, n_prompt=args.negative_prompt,
-                img=image.convert("RGB"), max_area=args.max_area, frame_num=args.frames,
-                sample_solver="euler" if args.lightning else "unipc", sampling_steps=args.steps,
-                guide_scale=(1.0, 1.0) if args.lightning else (3.5, 3.5),
-                seed=args.seed, shift=5.0, offload_model=bool(args.model_dir))
+        try:
+            with Image.open(args.image) as image:
+                video = self.model.generate(input_prompt=args.prompt, n_prompt=args.negative_prompt,
+                    img=image.convert("RGB"), max_area=args.max_area, frame_num=args.frames,
+                    sample_solver="euler" if args.lightning else "unipc", sampling_steps=args.steps,
+                    guide_scale=(1.0, 1.0) if args.lightning else (3.5, 3.5),
+                    seed=args.seed, shift=5.0, offload_model=bool(args.model_dir))
+        except torch.cuda.OutOfMemoryError as error:
+            raise_cuda_oom(error)
         if args.memory_telemetry:
             log_cuda_memory("after-generation")
         from wan.utils.utils import save_video
@@ -378,7 +408,14 @@ def run_daemon(args: argparse.Namespace) -> int:
         worker = WanVideoWorker(args, daemon=True)
     except Exception as error:
         logging.exception("Daemon initialization failed")
-        print(json.dumps({"status": "error", "error": str(error)}), flush=True)
+        print(json.dumps({
+            "status": "error",
+            "error": (
+                cuda_oom_diagnostics(error)
+                if isinstance(error, torch.cuda.OutOfMemoryError)
+                else str(error)
+            ),
+        }), flush=True)
         return 1
     print("READY", flush=True)
     try:
@@ -407,7 +444,11 @@ def run_daemon(args: argparse.Namespace) -> int:
                 print(json.dumps(response), flush=True)
             except Exception as error:
                 logging.exception("Daemon task failed")
-                response = {"status": "error", "error": str(error)}
+                response = {"status": "error", "error": (
+                    cuda_oom_diagnostics(error)
+                    if isinstance(error, torch.cuda.OutOfMemoryError)
+                    else str(error)
+                )}
                 if isinstance(task, dict):
                     request_id = task.get("request_id", task.get("id"))
                     if request_id is not None:
