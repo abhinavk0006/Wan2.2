@@ -36,6 +36,11 @@ class KaggleRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             worker._validate_runtime_args()
 
+    def test_wrapper_protocol_names_are_documented_in_task_surface(self):
+        source = Path(__file__).with_name("kaggle_generate_video.py").read_text()
+        for field in ("input_image", "output_video", "clip_duration", "clip_name"):
+            self.assertIn(field, source)
+
 
 if __name__ == "__main__":
     unittest.main()

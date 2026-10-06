@@ -17,8 +17,10 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import hashlib
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 from types import MethodType
@@ -258,7 +260,30 @@ class WanVideoWorker:
 
     def generate(self, task: dict) -> Path:
         args = copy.copy(self.args)
-        for key in ("image", "prompt", "negative_prompt", "output", "steps", "frames", "seed", "max_area"):
+        required = ("input_image", "output_video", "prompt")
+        missing = [key for key in required if not str(task.get(key, "")).strip()]
+        if missing:
+            raise ValueError(f"Missing daemon task field(s): {', '.join(missing)}")
+        args.image = task["input_image"]
+        args.output = task["output_video"]
+        args.prompt = task["prompt"]
+        args.negative_prompt = task.get("negative_prompt", "")
+        if "frames" in task:
+            args.frames = int(task["frames"])
+        elif "clip_duration" in task:
+            duration = float(task["clip_duration"])
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("clip_duration must be a finite number greater than zero")
+            raw_frames = duration * self.config.sample_fps
+            args.frames = max(17, 4 * math.ceil((raw_frames - 1) / 4) + 1)
+        if "seed" in task:
+            args.seed = int(task["seed"])
+        elif task.get("clip_name"):
+            args.seed = int.from_bytes(
+                hashlib.sha256(str(task["clip_name"]).encode("utf-8")).digest()[:4],
+                "big",
+            )
+        for key in ("steps", "max_area"):
             if key in task:
                 setattr(args, key, task[key])
         args.image, args.output = Path(args.image), Path(args.output)
@@ -290,10 +315,9 @@ def run_daemon(args: argparse.Namespace) -> int:
         worker = WanVideoWorker(args, daemon=True)
     except Exception as error:
         logging.exception("Daemon initialization failed")
-        print(json.dumps({"event": "ERROR", "error": str(error),
-                          "type": type(error).__name__}), flush=True)
+        print(json.dumps({"status": "error", "error": str(error)}), flush=True)
         return 1
-    print(json.dumps({"event": "READY", "protocol": 1}), flush=True)
+    print("READY", flush=True)
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -301,16 +325,15 @@ def run_daemon(args: argparse.Namespace) -> int:
             task = json.loads(line)
             if not isinstance(task, dict):
                 raise ValueError("Each daemon input line must be a JSON object.")
-            if task.get("op") == "exit":
-                print(json.dumps({"event": "EXITING"}), flush=True)
+            if task.get("action") == "exit" or task.get("op") == "exit":
                 worker.cleanup()
                 return 0
             output = worker.generate(task)
-            print(json.dumps({"ok": True, "output": str(output)}), flush=True)
+            del output
+            print(json.dumps({"status": "success"}), flush=True)
         except Exception as error:
             logging.exception("Daemon task failed")
-            print(json.dumps({"ok": False, "error": str(error),
-                              "type": type(error).__name__}), flush=True)
+            print(json.dumps({"status": "error", "error": str(error)}), flush=True)
         finally:
             # Also release a partially loaded expert when generation fails.
             worker.cleanup()
