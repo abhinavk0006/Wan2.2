@@ -53,6 +53,18 @@ class KaggleRunnerTests(unittest.TestCase):
         self.assertIsInstance(task["seed"], int)
         self.assertEqual(task["image"], "in.png")
 
+    def test_invalid_task_values_fail_before_model_execution(self):
+        with self.assertRaisesRegex(ValueError, "frames must be 4n"):
+            normalize_daemon_task({
+                "input_image": "in.png", "output_video": "out.mp4",
+                "prompt": "move", "frames": 18,
+            })
+        with self.assertRaisesRegex(ValueError, "steps must be an integer"):
+            normalize_daemon_task({
+                "input_image": "in.png", "output_video": "out.mp4",
+                "prompt": "move", "steps": "many",
+            })
+
     def test_daemon_retains_state_until_exit(self):
         class FakeWorker:
             cleanups = 0
@@ -79,6 +91,30 @@ class KaggleRunnerTests(unittest.TestCase):
             self.assertEqual(kaggle_generate_video.run_daemon(object()), 0)
         self.assertEqual(FakeWorker.generations, 2)
         self.assertEqual(FakeWorker.cleanups, 1)
+        self.assertIn('"action": "shutdown"', stdout.getvalue())
+
+    def test_daemon_supports_shutdown_and_request_correlation(self):
+        class FakeWorker:
+            def __init__(self, args, daemon=False):
+                pass
+
+            def generate(self, task):
+                pass
+
+            def cleanup(self):
+                pass
+
+        stdin = io.StringIO(
+            '{"request_id":"clip-1","input_image":"in.png","output_video":"a.mp4","prompt":"a"}\n'
+            '{"request_id":"stop-1","op":"shutdown"}\n'
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(kaggle_generate_video, "WanVideoWorker", FakeWorker), \
+             mock.patch.object(kaggle_generate_video.sys, "stdin", stdin), \
+             mock.patch.object(kaggle_generate_video.sys, "stdout", stdout):
+            self.assertEqual(kaggle_generate_video.run_daemon(object()), 0)
+        self.assertIn('"request_id": "clip-1"', stdout.getvalue())
+        self.assertIn('"request_id": "stop-1"', stdout.getvalue())
 
 
 if __name__ == "__main__":

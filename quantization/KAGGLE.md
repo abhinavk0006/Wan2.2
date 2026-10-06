@@ -118,11 +118,15 @@ TASKS
 
 The first stdout line is `READY`. Each subsequent task produces one JSON
 response: `{"status":"success"}` or `{"status":"error","error":"..."}`;
-errors do not stop the worker or discard reusable model state. Tasks use the existing wrapper fields
-`input_image`, `output_video`, `prompt`, `negative_prompt`, `clip_duration`
-(or `frames`), and optional `clip_name`/`seed`. `{"action":"exit"}` cleanly
-exits. Blank lines are ignored and EOF also exits cleanly. Logs are written
-to stderr, so stdout remains machine-readable.
+errors do not stop the worker or discard reusable model state. Tasks use the
+existing wrapper fields `input_image`, `output_video`, `prompt`,
+`negative_prompt`, `clip_duration` (or `frames`), and optional
+`clip_name`/`seed`. An optional `request_id` (or `id`) is copied into the
+response for pipeline correlation. `{"action":"exit"}`,
+`{"action":"shutdown"}`, and `{"op":"shutdown"}` cleanly exit after emitting a
+shutdown acknowledgement. Unsupported actions and malformed task fields
+produce explicit error responses. Blank lines are ignored and EOF also exits
+cleanly. Logs are written to stderr, so stdout remains machine-readable.
 
 4. When the command finishes, the MP4 is at
    `/kaggle/working/wan_i2v_preview.mp4`. Download it from the Kaggle output

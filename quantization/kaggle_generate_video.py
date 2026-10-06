@@ -145,14 +145,20 @@ def normalize_daemon_task(task: dict, *, sample_fps: int = 16) -> dict:
         "negative_prompt": task.get("negative_prompt", ""),
     }
     if "frames" in task:
-        normalized["frames"] = int(task["frames"])
+        try:
+            normalized["frames"] = int(task["frames"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("frames must be an integer") from error
     elif "clip_duration" in task:
         duration = float(task["clip_duration"])
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("clip_duration must be a finite number greater than zero")
         normalized["frames"] = max(17, 4 * math.ceil((duration * sample_fps - 1) / 4) + 1)
     if "seed" in task:
-        normalized["seed"] = int(task["seed"])
+        try:
+            normalized["seed"] = int(task["seed"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("seed must be an integer") from error
     elif task.get("clip_name"):
         normalized["seed"] = int.from_bytes(
             hashlib.sha256(str(task["clip_name"]).encode("utf-8")).digest()[:4],
@@ -160,7 +166,18 @@ def normalize_daemon_task(task: dict, *, sample_fps: int = 16) -> dict:
         )
     for key in ("steps", "max_area"):
         if key in task:
-            normalized[key] = task[key]
+            try:
+                normalized[key] = int(task[key])
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{key} must be an integer") from error
+    if "frames" in normalized and (
+        normalized["frames"] < 1 or (normalized["frames"] - 1) % 4
+    ):
+        raise ValueError("frames must be 4n+1, for example 17 or 49")
+    if "steps" in normalized and normalized["steps"] < 2:
+        raise ValueError("steps must be at least 2")
+    if "max_area" in normalized and normalized["max_area"] <= 0:
+        raise ValueError("max_area must be greater than zero")
     return normalized
 
 
@@ -212,10 +229,47 @@ class WanVideoWorker:
             gc.collect()
         self.config, self.model = config, model
         model.release_t5_after_encode = not daemon
+        self._t5_checkpoint = checkpoint_dir / config.t5_checkpoint
+        self._t5_tokenizer_path = config.t5_tokenizer
+        self._t5_released_for_expert_swap = False
         if not args.model_dir:
             model._staged_expert_loading = True
             model._wan_worker = self
             model._prepare_model_for_timestep = MethodType(WanVideoWorker._prepare_expert, model)
+
+    def _release_t5_for_expert_swap(self) -> None:
+        """Free CPU T5 weights before converting the opposite DiT expert."""
+        text_encoder = getattr(self.model, "text_encoder", None)
+        if text_encoder is None or text_encoder.model is None:
+            return
+        text_encoder.model = None
+        gc.collect()
+        self._t5_released_for_expert_swap = True
+        logging.info("Released CPU T5 weights before expert conversion")
+
+    def _restore_t5_after_expert_swap(self) -> None:
+        """Restore T5 after expert conversion so the daemon can serve the next task."""
+        if not self._t5_released_for_expert_swap:
+            return
+        if not self._t5_checkpoint.is_file():
+            self._t5_checkpoint = download(
+                HF_I2V_REPO, self.config.t5_checkpoint, MODELS_DIR
+            )
+        from wan.modules.t5 import T5EncoderModel
+
+        tokenizer_path = self._t5_tokenizer_path
+        local_tokenizer_path = self._t5_checkpoint.parent / tokenizer_path
+        if local_tokenizer_path.is_dir():
+            tokenizer_path = str(local_tokenizer_path)
+        self.model.text_encoder = T5EncoderModel(
+            text_len=self.config.text_len,
+            dtype=self.config.t5_dtype,
+            device=torch.device("cpu"),
+            checkpoint_path=str(self._t5_checkpoint),
+            tokenizer_path=tokenizer_path,
+        )
+        self._t5_released_for_expert_swap = False
+        logging.info("Restored CPU T5 weights after expert conversion")
 
     def _validate_runtime_args(self):
         args = self.args
@@ -242,6 +296,7 @@ class WanVideoWorker:
         if expert is None:
             other = getattr(self, other_name)
             if other is not None:
+                worker._release_t5_for_expert_swap()
                 setattr(self, other_name, None)
                 del other
                 gc.collect()
@@ -276,19 +331,19 @@ class WanVideoWorker:
                 if adapter is not None:
                     adapter.unlink(missing_ok=True)
                 gc.collect()
+            worker._restore_t5_after_expert_swap()
             logging.info("Loaded %s on %s", expert_name, self.device)
         return getattr(self, expert_name)
 
     def cleanup(self):
-        if self.args.model_dir:
-            return
         for name in ("high_noise_model", "low_noise_model"):
             expert = getattr(self.model, name, None)
             if expert is not None:
                 setattr(self.model, name, None)
                 del expert
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def generate(self, task: dict) -> Path:
         args = copy.copy(self.args)
@@ -330,17 +385,34 @@ def run_daemon(args: argparse.Namespace) -> int:
         for line in sys.stdin:
             if not line.strip():
                 continue
+            task = None
             try:
                 task = json.loads(line)
                 if not isinstance(task, dict):
                     raise ValueError("Each daemon input line must be a JSON object.")
-                if task.get("action") == "exit" or task.get("op") == "exit":
+                request_id = task.get("request_id", task.get("id"))
+                action = task.get("action", task.get("op"))
+                if action in ("exit", "shutdown", "stop"):
+                    response = {"status": "success", "action": "shutdown"}
+                    if request_id is not None:
+                        response["request_id"] = request_id
+                    print(json.dumps(response), flush=True)
                     return 0
+                if action is not None:
+                    raise ValueError(f"Unsupported daemon action: {action!r}")
                 worker.generate(task)
-                print(json.dumps({"status": "success"}), flush=True)
+                response = {"status": "success"}
+                if request_id is not None:
+                    response["request_id"] = request_id
+                print(json.dumps(response), flush=True)
             except Exception as error:
                 logging.exception("Daemon task failed")
-                print(json.dumps({"status": "error", "error": str(error)}), flush=True)
+                response = {"status": "error", "error": str(error)}
+                if isinstance(task, dict):
+                    request_id = task.get("request_id", task.get("id"))
+                    if request_id is not None:
+                        response["request_id"] = request_id
+                print(json.dumps(response), flush=True)
         return 0
     finally:
         # Keep T5/VAE and the last staged expert resident between tasks. Only
