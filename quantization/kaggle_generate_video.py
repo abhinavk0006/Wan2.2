@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import sys
+import time
 from pathlib import Path
 from types import MethodType
 
@@ -262,7 +263,9 @@ class WanVideoWorker:
                     path.unlink(missing_ok=True)
             gc.collect()
         self.config, self.model = config, model
-        model.release_t5_after_encode = not daemon
+        # Keep the daemon's CPU text encoder only long enough to encode a prompt.
+        # Restoring it between high/low expert swaps needlessly reloads 11+ GiB.
+        model.release_t5_after_encode = True
         model.vae_cpu_offload = not bool(args.model_dir)
         self._t5_checkpoint = checkpoint_dir / config.t5_checkpoint
         self._t5_tokenizer_path = config.t5_tokenizer
@@ -346,9 +349,12 @@ class WanVideoWorker:
                 from kaggle_single_expert import load_fp8_scaled_wan_checkpoint, dispatch_wan_model_across_gpus
                 logging.info("Converting %s to custom INT8 Linear layers%s", expert_name,
                              " with merged 4-step Lightning LoRA" if adapter else "")
+                conversion_started = time.perf_counter()
                 expert, details = load_fp8_scaled_wan_checkpoint(checkpoint, lora_file=adapter)
                 logging.info("Converted %s FP8 tensors; replaced %s Linear layers; merged %s LoRA targets",
                              details["fp8_scaled_weights_decoded"], details["int8_modules"], details["lora_targets_merged"])
+                logging.info("%s conversion completed in %.1fs", expert_name,
+                             time.perf_counter() - conversion_started)
                 gpu_ids = [self.device.index] + [i for i in range(torch.cuda.device_count())
                                                   if i != self.device.index]
                 expert, device_map = dispatch_wan_model_across_gpus(
@@ -356,6 +362,7 @@ class WanVideoWorker:
                     max_memory_gib_by_device={i: budget for i, budget in
                                               ((0, args.gpu0_memory_gib), (1, args.gpu1_memory_gib))
                                               if budget is not None})
+                logging.info("%s dispatch completed", expert_name)
                 logging.info("Expert device map: %s", device_map)
                 if args.memory_telemetry:
                     log_cuda_memory(f"after-{expert_name}")
@@ -366,7 +373,6 @@ class WanVideoWorker:
                 if adapter is not None:
                     adapter.unlink(missing_ok=True)
                 gc.collect()
-            worker._restore_t5_after_expert_swap()
             logging.info("Loaded %s on %s", expert_name, self.device)
         return getattr(self, expert_name)
 
@@ -392,19 +398,28 @@ class WanVideoWorker:
             raise ValueError("Wan frame counts must be 4n+1, for example 17 or 49.")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         try:
+            if getattr(self.model.text_encoder, "model", None) is None:
+                self._t5_released_for_expert_swap = True
+                restore_started = time.perf_counter()
+                self._restore_t5_after_expert_swap()
+                logging.info("T5 restore completed in %.1fs", time.perf_counter() - restore_started)
+            generation_started = time.perf_counter()
             with Image.open(args.image) as image:
                 video = self.model.generate(input_prompt=args.prompt, n_prompt=args.negative_prompt,
                     img=image.convert("RGB"), max_area=args.max_area, frame_num=args.frames,
                     sample_solver="euler" if args.lightning else "unipc", sampling_steps=args.steps,
                     guide_scale=(1.0, 1.0) if args.lightning else (3.5, 3.5),
                     seed=args.seed, shift=5.0, offload_model=bool(args.model_dir))
+            logging.info("Wan denoising completed in %.1fs", time.perf_counter() - generation_started)
         except torch.cuda.OutOfMemoryError as error:
             raise_cuda_oom(error)
         if args.memory_telemetry:
             log_cuda_memory("after-generation")
         from wan.utils.utils import save_video
+        save_started = time.perf_counter()
         save_video(tensor=video[None], save_file=str(args.output), fps=self.config.sample_fps,
                    nrow=1, normalize=True, value_range=(-1, 1))
+        logging.info("Video encoding completed in %.1fs", time.perf_counter() - save_started)
         del video
         if not args.output.is_file() or args.output.stat().st_size == 0:
             raise RuntimeError(f"Video writer did not produce a non-empty file at {args.output}")
@@ -479,8 +494,8 @@ def run_daemon(args: argparse.Namespace) -> int:
                     return DAEMON_CUDA_OOM_EXIT_CODE
         return 0
     finally:
-        # Keep T5/VAE and the last staged expert resident between tasks. Only
-        # process termination or an explicit exit releases CUDA allocations.
+        # Keep the VAE and staged expert available until daemon shutdown. T5 is
+        # released after prompt encoding and restored only when the next clip needs it.
         worker.cleanup()
         sys.stderr.flush()
 
