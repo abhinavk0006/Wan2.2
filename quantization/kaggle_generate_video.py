@@ -270,6 +270,7 @@ class WanVideoWorker:
         self._t5_checkpoint = checkpoint_dir / config.t5_checkpoint
         self._t5_tokenizer_path = config.t5_tokenizer
         self._t5_released_for_expert_swap = False
+        self._prompt_context_cache: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
         if not args.model_dir:
             model._staged_expert_loading = True
             model._wan_worker = self
@@ -308,6 +309,43 @@ class WanVideoWorker:
         )
         self._t5_released_for_expert_swap = False
         logging.info("Restored CPU T5 weights after expert conversion")
+
+    def prepare_prompts(self, prompts: list[dict]) -> int:
+        """Encode all experiment prompts once, retain only small CPU contexts."""
+        if not prompts:
+            return 0
+        encoder = self.model.text_encoder
+        if encoder.model is None:
+            self._restore_t5_after_expert_swap()
+        started = time.perf_counter()
+        for item in prompts:
+            key = str(item.get("cache_key", "")).strip()
+            prompt = str(item.get("prompt", ""))
+            negative = str(item.get("negative_prompt", ""))
+            if not key or not prompt:
+                raise ValueError("Each prompt needs a non-empty cache_key and prompt")
+            if key in self._prompt_context_cache:
+                continue
+            positive_context = encoder([prompt], torch.device("cpu"))
+            negative_context = encoder([negative], torch.device("cpu"))
+            self._prompt_context_cache[key] = (
+                [tensor.detach().cpu() for tensor in positive_context],
+                [tensor.detach().cpu() for tensor in negative_context],
+            )
+        encoder.model = None
+        gc.collect()
+        self._t5_released_for_expert_swap = True
+        context_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for positive, negative in self._prompt_context_cache.values()
+            for tensor in (*positive, *negative)
+        )
+        logging.info(
+            "Cached %d prompt pairs (%.1f MiB) on CPU in %.1fs; released T5 weights",
+            len(self._prompt_context_cache), context_bytes / 2**20,
+            time.perf_counter() - started,
+        )
+        return len(prompts)
 
     def _validate_runtime_args(self):
         args = self.args
@@ -382,6 +420,7 @@ class WanVideoWorker:
             if expert is not None:
                 setattr(self.model, name, None)
                 del expert
+        self._prompt_context_cache.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -398,7 +437,9 @@ class WanVideoWorker:
             raise ValueError("Wan frame counts must be 4n+1, for example 17 or 49.")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         try:
-            if getattr(self.model.text_encoder, "model", None) is None:
+            cache_key = str(task.get("prompt_cache_key", ""))
+            cached_context = self._prompt_context_cache.get(cache_key)
+            if cached_context is None and getattr(self.model.text_encoder, "model", None) is None:
                 self._t5_released_for_expert_swap = True
                 restore_started = time.perf_counter()
                 self._restore_t5_after_expert_swap()
@@ -409,7 +450,9 @@ class WanVideoWorker:
                     img=image.convert("RGB"), max_area=args.max_area, frame_num=args.frames,
                     sample_solver="euler" if args.lightning else "unipc", sampling_steps=args.steps,
                     guide_scale=(1.0, 1.0) if args.lightning else (3.5, 3.5),
-                    seed=args.seed, shift=5.0, offload_model=bool(args.model_dir))
+                    seed=args.seed, shift=5.0, offload_model=bool(args.model_dir),
+                    encoded_context=cached_context[0] if cached_context else None,
+                    encoded_negative_context=cached_context[1] if cached_context else None)
             logging.info("Wan denoising completed in %.1fs", time.perf_counter() - generation_started)
         except torch.cuda.OutOfMemoryError as error:
             raise_cuda_oom(error)
@@ -462,6 +505,13 @@ def run_daemon(args: argparse.Namespace) -> int:
                         response["request_id"] = request_id
                     print(json.dumps(response), flush=True)
                     return 0
+                if action == "prepare_prompts":
+                    count = worker.prepare_prompts(task.get("prompts", []))
+                    response = {"status": "success", "prepared_prompts": count}
+                    if request_id is not None:
+                        response["request_id"] = request_id
+                    print(json.dumps(response), flush=True)
+                    continue
                 if action is not None:
                     raise ValueError(f"Unsupported daemon action: {action!r}")
                 worker.generate(task)
@@ -494,8 +544,7 @@ def run_daemon(args: argparse.Namespace) -> int:
                     return DAEMON_CUDA_OOM_EXIT_CODE
         return 0
     finally:
-        # Keep the VAE and staged expert available until daemon shutdown. T5 is
-        # released after prompt encoding and restored only when the next clip needs it.
+        # Keep the VAE, staged expert, and compact prompt contexts until shutdown.
         worker.cleanup()
         sys.stderr.flush()
 
@@ -530,3 +579,4 @@ if __name__ == "__main__":
     sys.path.insert(0, str(REPO_ROOT))
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     main()
+
