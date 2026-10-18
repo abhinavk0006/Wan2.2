@@ -117,6 +117,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional mounted folder containing the original Comfy FP8 expert filenames; read directly without copying, downloading or deleting them.")
     parser.add_argument("--profile-stages", action="store_true",
         help="Synchronize stage boundaries and write per-request timing/CUDA memory metrics next to the output video.")
+    parser.add_argument("--cpu-expert-cache-gib", type=float, default=14,
+        help="Bounded CPU reuse of the high-noise expert; 0 disables. Evicted when conversion needs RAM.")
+    parser.add_argument("--host-reserve-gib", type=float, default=3)
+    parser.add_argument("--expert-cache-dir", type=Path,
+        help="Optional converted-expert disk cache. Two experts need about 27 GiB plus source download space.")
+    parser.add_argument("--expert-cache-max-gib", type=float, default=32)
+    parser.add_argument("--prompt-cache-dir", type=Path, default=MODELS_DIR / "prompt_cache")
+    parser.add_argument("--vae-stream-to-cpu", action="store_true",
+        help="Copy completed temporal VAE chunks to CPU instead of accumulating decoded video on GPU.")
+    parser.add_argument("--quantization", choices=["per_tensor", "per_channel"], default="per_tensor")
+    parser.add_argument("--placement", choices=["balanced", "contiguous"], default="balanced",
+        help="Experimental contiguous placement reduces GPU boundaries but changes activation headroom.")
+    parser.add_argument('--capture-linear-inputs', type=Path)
+    parser.add_argument('--capture-layer', action='append', default=[])
+    parser.add_argument('--capture-max-tokens', type=int, default=32)
+    parser.add_argument('--stream-expert-to-gpu', action='store_true',
+        help='Place converted tensors directly on planned GPUs, avoiding a complete second CPU expert beside a cached expert.')
+    parser.add_argument("--keep-fp16", action="append", default=[],
+        help="Experimental glob of Linear module names to retain in FP16; repeat to select multiple groups.")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
         "--max-memory-gib",
@@ -257,6 +276,8 @@ class WanVideoWorker:
         else:
             shared = [download(HF_I2V_REPO, config.t5_checkpoint, MODELS_DIR),
                       download(HF_I2V_REPO, config.vae_checkpoint, MODELS_DIR)]
+        from runtime_cache import file_identity
+        t5_cache_identity = file_identity(checkpoint_dir / config.t5_checkpoint)
         model = None
         try:
             model = WanI2V(config, str(checkpoint_dir), device_id=args.device,
@@ -276,6 +297,27 @@ class WanVideoWorker:
         self._t5_released_for_expert_swap = False
         self._prompt_context_cache: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
         self._prompt_text_cache: dict[str, tuple[str, str]] = {}
+        from runtime_cache import ExpertCache, PromptDiskCache, cache_source_identity, file_identity, digest
+        self._expert_cache = ExpertCache(cpu_gib=args.cpu_expert_cache_gib,
+            reserve_gib=args.host_reserve_gib, directory=args.expert_cache_dir,
+            disk_gib=args.expert_cache_max_gib)
+        self._expert_keys = {}
+        self._expert_weight_ids = {}
+        self._expert_active_keys = {}
+        self._conversion_identity = cache_source_identity()
+        tokenizer = model.text_encoder.tokenizer.tokenizer
+        tokenizer_identity = tokenizer.backend_tokenizer.to_str() if hasattr(tokenizer, 'backend_tokenizer') else {
+            'vocabulary': tokenizer.get_vocab(), 'special_tokens': tokenizer.special_tokens_map,
+            'settings': tokenizer.init_kwargs}
+        self._prompt_disk_cache = PromptDiskCache(args.prompt_cache_dir, {
+            "checkpoint": t5_cache_identity,
+            "dtype": str(config.t5_dtype), "text_len": config.text_len,
+            "tokenizer": config.t5_tokenizer,
+            "tokenizer_sha256": digest(tokenizer_identity),
+            "tokenizer_implementation": file_identity(REPO_ROOT / 'wan/modules/tokenizers.py'),
+            "implementation": file_identity(REPO_ROOT / 'wan/modules/t5.py'),
+        })
+        model.vae.stream_to_cpu = args.vae_stream_to_cpu
         self._current_metrics = None
         self._phase_starts = {}
         model._wan_worker = self
@@ -318,6 +360,9 @@ class WanVideoWorker:
         metrics.update(status=status, error=error,
             wall_seconds=time.perf_counter() - self._request_started,
             incomplete_stages=list(self._phase_starts))
+        if hasattr(self, '_expert_cache'):
+            from runtime_cache import available_ram
+            metrics['host_ram_available_bytes_at_finish'] = available_ram()
         if self.args.profile_stages:
             try:
                 metrics["cuda"] = self._memory_snapshot()
@@ -370,6 +415,9 @@ class WanVideoWorker:
         """Encode all experiment prompts once, retain only small CPU contexts."""
         if not prompts:
             return 0
+        if not hasattr(self, '_prompt_disk_cache'):
+            from quantization.runtime_cache import PromptDiskCache
+            self._prompt_disk_cache = PromptDiskCache(None, {})
         pending = []
         for item in prompts:
             key = str(item.get("cache_key", "")).strip()
@@ -378,8 +426,16 @@ class WanVideoWorker:
             if not key or not prompt.strip():
                 raise ValueError("Each prompt needs a non-empty cache_key and prompt")
             if self._prompt_text_cache.get(key) != (prompt, negative):
-                pending.append((key, prompt, negative))
+                disk_key = self._prompt_disk_cache.key(prompt, negative, self.args.lightning)
+                cached = self._prompt_disk_cache.load(disk_key)
+                if cached is not None:
+                    self._prompt_context_cache[key] = cached
+                    self._prompt_text_cache[key] = (prompt, negative)
+                    logging.info("Prompt disk cache hit: %s", key)
+                else:
+                    pending.append((key, prompt, negative))
         if not pending:
+            self._release_t5_for_expert_swap()
             return len(prompts)
         encoder = self.model.text_encoder
         if encoder.model is None:
@@ -399,6 +455,11 @@ class WanVideoWorker:
                 [tensor.detach().cpu() for tensor in negative_context],
             )
             self._prompt_text_cache[key] = (prompt, negative)
+            try:
+                self._prompt_disk_cache.save(self._prompt_disk_cache.key(prompt, negative, self.args.lightning),
+                    self._prompt_context_cache[key])
+            except OSError:
+                logging.warning("Prompt cache write failed; retaining RAM contexts", exc_info=True)
         encoder.model = None
         gc.collect()
         self._t5_released_for_expert_swap = True
@@ -416,6 +477,10 @@ class WanVideoWorker:
 
     def _validate_runtime_args(self):
         args = self.args
+        for name in ('cpu_expert_cache_gib', 'host_reserve_gib', 'expert_cache_max_gib'):
+            value = getattr(args, name, 0)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'{name} must be finite and nonnegative')
         if args.expert_source_dir:
             for filename in EXPERT_FILES.values():
                 if not (args.expert_source_dir / filename).is_file():
@@ -446,43 +511,90 @@ class WanVideoWorker:
             if other is not None:
                 worker._release_t5_for_expert_swap()
                 setattr(self, other_name, None)
+                worker._retain_expert(other_name, other)
                 del other
                 gc.collect()
                 torch.cuda.empty_cache()
+            cache_status = "miss"
+            key = worker._expert_keys.get(expert_name)
+            details = {}
+            if key:
+                expert = worker._expert_cache.take_cpu(key)
+                if expert is not None:
+                    cache_status = "cpu_hit"
+                else:
+                    expert = worker._expert_cache.load_disk(key)
+                    if expert is not None:
+                        cache_status = "disk_hit"
             mounted_checkpoint = args.expert_source_dir / EXPERT_FILES[expert_name] if args.expert_source_dir else None
             if mounted_checkpoint is not None and not mounted_checkpoint.is_file():
                 raise FileNotFoundError(f"Mounted expert is missing: {mounted_checkpoint}")
-            checkpoint = mounted_checkpoint or download(HF_COMFY_REPO, COMFY_PREFIX + EXPERT_FILES[expert_name], MODELS_DIR)
+            checkpoint = None
             adapter = None
             try:
-                if args.lightning:
+                if expert is None:
+                    checkpoint = mounted_checkpoint or download(HF_COMFY_REPO, COMFY_PREFIX + EXPERT_FILES[expert_name], MODELS_DIR)
+                if expert is None and args.lightning:
                     adapter = download(HF_LIGHTNING_REPO,
                                        f"{LIGHTNING_ADAPTER_DIR}/{expert_name}.safetensors",
                                        MODELS_DIR / "lightning")
                 from kaggle_single_expert import load_fp8_scaled_wan_checkpoint, dispatch_wan_model_across_gpus
-                logging.info("Converting %s to custom INT8 Linear layers%s", expert_name,
-                             " with merged 4-step Lightning LoRA" if adapter else "")
-                conversion_started = time.perf_counter()
-                expert, details = load_fp8_scaled_wan_checkpoint(checkpoint, lora_file=adapter)
-                logging.info("Converted %s FP8 tensors; replaced %s Linear layers; merged %s LoRA targets",
-                             details["fp8_scaled_weights_decoded"], details["int8_modules"], details["lora_targets_merged"])
-                logging.info("%s conversion completed in %.1fs", expert_name,
-                             time.perf_counter() - conversion_started)
+                if expert is None:
+                    from runtime_cache import digest, file_identity
+                    if key is None:
+                        weight_identity = {'source': file_identity(checkpoint),
+                            'adapter': file_identity(adapter) if adapter else None}
+                        worker._expert_weight_ids[expert_name] = digest(weight_identity)
+                        key = digest({'expert': expert_name, **weight_identity,
+                            'quantization': args.quantization, 'keep_fp16': args.keep_fp16,
+                            'implementation': worker._conversion_identity})
+                        worker._expert_keys[expert_name] = key
+                    expert = worker._expert_cache.load_disk(key)
+                    if expert is not None:
+                        cache_status = "disk_hit"
+                    else:
+                        # The next converted expert is approximately source-sized;
+                        # release cached RAM when it would crowd conversion.
+                        worker._expert_cache.reserve_conversion_memory(2 * 2**30 if args.stream_expert_to_gpu else checkpoint.stat().st_size)
+                        logging.info("Converting %s to custom INT8 Linear layers%s", expert_name,
+                                     " with merged 4-step Lightning LoRA" if adapter else "")
+                        conversion_started = time.perf_counter()
+                        expert, details = load_fp8_scaled_wan_checkpoint(checkpoint, lora_file=adapter,
+                            quantization=args.quantization, keep_fp16=args.keep_fp16,
+                            gpu_ids=([self.device.index]+[i for i in range(torch.cuda.device_count()) if i!=self.device.index]) if args.stream_expert_to_gpu else None,
+                            max_memory_gib=args.max_memory_gib,
+                            max_memory_gib_by_device={i: budget for i,budget in ((0,args.gpu0_memory_gib),(1,args.gpu1_memory_gib)) if budget is not None},
+                            placement=args.placement)
+                        logging.info("%s conversion completed in %.1fs", expert_name,
+                                     time.perf_counter() - conversion_started)
+                        if mounted_checkpoint is None:
+                            checkpoint.unlink(missing_ok=True)
+                        try:
+                            worker._expert_cache.save_disk(key, expert, details['model_config'])
+                        except (OSError, RuntimeError):
+                            logging.warning('Expert disk cache write failed; continuing uncached', exc_info=True)
+                worker._expert_active_keys[expert_name] = key
+                logging.info('Expert cache %s: %s', expert_name, cache_status)
                 gpu_ids = [self.device.index] + [i for i in range(torch.cuda.device_count())
                                                   if i != self.device.index]
                 expert, device_map = dispatch_wan_model_across_gpus(
                     expert, gpu_ids, max_memory_gib=args.max_memory_gib,
+                    placement=args.placement,
+                    device_map_override=details.get('streamed_device_map'),
                     max_memory_gib_by_device={i: budget for i, budget in
                                               ((0, args.gpu0_memory_gib), (1, args.gpu1_memory_gib))
                                               if budget is not None})
                 logging.info("%s dispatch completed", expert_name)
+                from precision_calibration import install_capture
+                install_capture(expert, args.capture_linear_inputs, expert_name,
+                    args.capture_layer, args.capture_max_tokens, worker._expert_weight_ids.get(expert_name, ''))
                 logging.info("Expert device map: %s", device_map)
                 if args.memory_telemetry:
                     log_cuda_memory(f"after-{expert_name}")
                 torch.cuda.synchronize(self.device)
                 setattr(self, expert_name, expert)
             finally:
-                if mounted_checkpoint is None:
+                if mounted_checkpoint is None and checkpoint is not None:
                     checkpoint.unlink(missing_ok=True)
                 if adapter is not None:
                     adapter.unlink(missing_ok=True)
@@ -491,8 +603,14 @@ class WanVideoWorker:
             if worker._current_metrics is not None:
                 worker._current_metrics["expert_loads"].append({"expert": expert_name,
                     "wall_seconds": time.perf_counter() - expert_started,
-                    "includes": "source acquisition, LoRA merge, quantization and dispatch"})
+                    "cache_status": cache_status,
+                    "includes": "source acquisition, cache lookup/write, LoRA merge, quantization and dispatch"})
         return getattr(self, expert_name)
+
+    def _retain_expert(self, name, expert):
+        key = self._expert_active_keys.get(name)
+        if key:
+            self._expert_cache.retain(key, name, expert)
 
     def cleanup(self):
         for name in ("high_noise_model", "low_noise_model"):
@@ -502,6 +620,7 @@ class WanVideoWorker:
                 del expert
         self._prompt_context_cache.clear()
         self._prompt_text_cache.clear()
+        self._expert_cache.cpu.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -522,6 +641,11 @@ class WanVideoWorker:
         self._current_metrics = {"schema_version": 1, "frames": args.frames,
             "max_area": args.max_area, "seed": args.seed, "steps": args.steps,
             "sampling_mode": "lightning" if args.lightning else "base",
+            "quantization": args.quantization, "keep_fp16": args.keep_fp16,
+            "placement": args.placement,
+            "stream_expert_to_gpu": args.stream_expert_to_gpu,
+            "cpu_expert_cache_gib": args.cpu_expert_cache_gib,
+            "vae_stream_to_cpu": args.vae_stream_to_cpu,
             "profiling_synchronizes_cuda": args.profile_stages, "phases": [], "expert_loads": []}
         if args.profile_stages:
             for index in range(torch.cuda.device_count()):
@@ -547,7 +671,7 @@ class WanVideoWorker:
                     seed=args.seed, shift=5.0, offload_model=bool(args.model_dir),
                     encoded_context=cached_context[0] if cached_context else None,
                     encoded_negative_context=cached_context[1] if cached_context else None)
-            logging.info("Wan denoising completed in %.1fs", time.perf_counter() - generation_started)
+            logging.info("Wan generation (conditioning, expert loads, denoising and VAE) completed in %.1fs", time.perf_counter() - generation_started)
         except torch.cuda.OutOfMemoryError as error:
             self._finish_metrics(args, "cuda_oom", str(error))
             raise_cuda_oom(error)

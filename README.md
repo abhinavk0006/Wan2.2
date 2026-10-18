@@ -1,3 +1,11 @@
+## Experimental bounded runtime reuse
+
+The `codex/science-evidence-and-runtime-cache` branch adds bounded CPU expert reuse,
+optional tensor-only disk caches, reusable text contexts, VAE output streaming and
+opt-in precision/placement experiments. See
+[quantization/RUNTIME_OPTIMIZATIONS.md](quantization/RUNTIME_OPTIMIZATIONS.md).
+Performance and end-to-end quality have not been measured for this update.
+
 # Wan2.2 (Memory Optimized Fork)
 
 This fork contains custom memory optimizations designed to run Wan 2.2 models (including the **14B Image-to-Video** model) in RAM-constrained environments (e.g., 62GB CPU RAM / 46GB L40S GPU VRAM) without out-of-memory (OOM) crashes.
