@@ -162,18 +162,39 @@ def attention(
             version=fa_version,
         )
     else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
-            )
-        attn_mask = None
-
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
-
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
-        out = out.transpose(1, 2).contiguous()
-        return out
+        # Preserve FP16 from the T4 runner instead of converting every call
+        # to BF16. Trim each example to its real lengths so padding never
+        # participates in attention, without a quadratic padding mask.
+        out_dtype = v.dtype if v.dtype in (torch.float16, torch.bfloat16) else q.dtype
+        compute_dtype = v.dtype if v.dtype in (torch.float16, torch.bfloat16) else dtype
+        q = q.transpose(1, 2).to(compute_dtype)
+        k = k.transpose(1, 2).to(compute_dtype)
+        v = v.transpose(1, 2).to(compute_dtype)
+        if q_scale is not None:
+            q = q * q_scale
+        outputs = []
+        for index in range(q.size(0)):
+            nq = int(q_lens[index]) if q_lens is not None else q.size(2)
+            nk = int(k_lens[index]) if k_lens is not None else k.size(2)
+            if not 0 < nq <= q.size(2) or not 0 < nk <= k.size(2):
+                raise ValueError("Attention sequence lengths must be within the supplied tensors")
+            mask = None
+            if window_size != (-1, -1):
+                rows = torch.arange(nq, device=q.device)[:, None]
+                cols = torch.arange(nk, device=q.device)[None, :]
+                # Match FlashAttention's bottom-right window alignment.
+                center = rows + nk - nq
+                left, right = window_size
+                mask = torch.ones((nq, nk), device=q.device, dtype=torch.bool)
+                if left >= 0:
+                    mask &= cols >= center - left
+                if right >= 0:
+                    mask &= cols <= center + right
+                if causal:
+                    mask &= cols <= rows
+            value = torch.nn.functional.scaled_dot_product_attention(
+                q[index:index+1, :, :nq], k[index:index+1, :, :nk], v[index:index+1, :, :nk],
+                attn_mask=mask, is_causal=causal and mask is None,
+                dropout_p=dropout_p, scale=softmax_scale)
+            outputs.append(torch.nn.functional.pad(value, (0, 0, 0, q.size(2) - nq)))
+        return torch.cat(outputs).transpose(1, 2).contiguous().to(out_dtype)

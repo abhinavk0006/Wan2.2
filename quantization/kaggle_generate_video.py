@@ -113,6 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--frames", type=int, default=17)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--expert-source-dir", type=Path,
+        help="Optional mounted folder containing the original Comfy FP8 expert filenames; read directly without copying, downloading or deleting them.")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
         "--max-memory-gib",
@@ -271,6 +273,9 @@ class WanVideoWorker:
         self._t5_tokenizer_path = config.t5_tokenizer
         self._t5_released_for_expert_swap = False
         self._prompt_context_cache: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+        self._prompt_text_cache: dict[str, tuple[str, str]] = {}
+        if args.lightning:
+            logging.info("Lightning CFG=1: negative prompts do not affect denoising; encode positive constraints explicitly")
         if not args.model_dir:
             model._staged_expert_loading = True
             model._wan_worker = self
@@ -314,24 +319,35 @@ class WanVideoWorker:
         """Encode all experiment prompts once, retain only small CPU contexts."""
         if not prompts:
             return 0
+        pending = []
+        for item in prompts:
+            key = str(item.get("cache_key", "")).strip()
+            prompt = str(item.get("prompt", ""))
+            negative = str(item.get("negative_prompt", "")) or self.model.sample_neg_prompt
+            if not key or not prompt.strip():
+                raise ValueError("Each prompt needs a non-empty cache_key and prompt")
+            if self._prompt_text_cache.get(key) != (prompt, negative):
+                pending.append((key, prompt, negative))
+        if not pending:
+            return len(prompts)
         encoder = self.model.text_encoder
         if encoder.model is None:
             self._restore_t5_after_expert_swap()
         started = time.perf_counter()
-        for item in prompts:
-            key = str(item.get("cache_key", "")).strip()
-            prompt = str(item.get("prompt", ""))
-            negative = str(item.get("negative_prompt", ""))
-            if not key or not prompt:
-                raise ValueError("Each prompt needs a non-empty cache_key and prompt")
-            if key in self._prompt_context_cache:
-                continue
+        negative_contexts = {}
+        for key, prompt, negative in pending:
             positive_context = encoder([prompt], torch.device("cpu"))
-            negative_context = encoder([negative], torch.device("cpu"))
+            if self.args.lightning:
+                negative_context = []  # CFG=1 never evaluates the unconditional branch.
+            else:
+                if negative not in negative_contexts:
+                    negative_contexts[negative] = encoder([negative], torch.device("cpu"))
+                negative_context = negative_contexts[negative]
             self._prompt_context_cache[key] = (
                 [tensor.detach().cpu() for tensor in positive_context],
                 [tensor.detach().cpu() for tensor in negative_context],
             )
+            self._prompt_text_cache[key] = (prompt, negative)
         encoder.model = None
         gc.collect()
         self._t5_released_for_expert_swap = True
@@ -349,6 +365,10 @@ class WanVideoWorker:
 
     def _validate_runtime_args(self):
         args = self.args
+        if args.expert_source_dir:
+            for filename in EXPERT_FILES.values():
+                if not (args.expert_source_dir / filename).is_file():
+                    raise FileNotFoundError(f"Mounted expert is missing: {args.expert_source_dir / filename}")
         if args.lightning and args.model_dir:
             raise ValueError("--lightning currently requires the streamed Comfy FP8 checkpoint path; omit --model-dir.")
         if args.lightning and args.steps not in (4, 20):
@@ -377,7 +397,10 @@ class WanVideoWorker:
                 del other
                 gc.collect()
                 torch.cuda.empty_cache()
-            checkpoint = download(HF_COMFY_REPO, COMFY_PREFIX + EXPERT_FILES[expert_name], MODELS_DIR)
+            mounted_checkpoint = args.expert_source_dir / EXPERT_FILES[expert_name] if args.expert_source_dir else None
+            if mounted_checkpoint is not None and not mounted_checkpoint.is_file():
+                raise FileNotFoundError(f"Mounted expert is missing: {mounted_checkpoint}")
+            checkpoint = mounted_checkpoint or download(HF_COMFY_REPO, COMFY_PREFIX + EXPERT_FILES[expert_name], MODELS_DIR)
             adapter = None
             try:
                 if args.lightning:
@@ -407,7 +430,8 @@ class WanVideoWorker:
                 torch.cuda.synchronize(self.device)
                 setattr(self, expert_name, expert)
             finally:
-                checkpoint.unlink(missing_ok=True)
+                if mounted_checkpoint is None:
+                    checkpoint.unlink(missing_ok=True)
                 if adapter is not None:
                     adapter.unlink(missing_ok=True)
                 gc.collect()
@@ -421,6 +445,7 @@ class WanVideoWorker:
                 setattr(self.model, name, None)
                 del expert
         self._prompt_context_cache.clear()
+        self._prompt_text_cache.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -439,6 +464,9 @@ class WanVideoWorker:
         try:
             cache_key = str(task.get("prompt_cache_key", ""))
             cached_context = self._prompt_context_cache.get(cache_key)
+            effective_negative = args.negative_prompt or self.model.sample_neg_prompt
+            if self._prompt_text_cache.get(cache_key) != (args.prompt, effective_negative):
+                cached_context = None
             if cached_context is None and getattr(self.model.text_encoder, "model", None) is None:
                 self._t5_released_for_expert_swap = True
                 restore_started = time.perf_counter()

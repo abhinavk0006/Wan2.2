@@ -107,10 +107,11 @@ class Int8Linear(nn.Module):
 
     def forward(self, x):
 
-        weight = self.dequantize_weight().to(
-            device=x.device,
-            dtype=x.dtype,
-        )
+        # INT8 values are exactly representable in FP16/BF16. Expand directly
+        # into the activation dtype and scale in place, avoiding two full
+        # FP32 weight buffers followed by a third FP16 allocation per forward.
+        weight = self.weight_int8.to(device=x.device, dtype=x.dtype)
+        weight.mul_(self.scale.to(device=x.device))
 
         bias = None
 

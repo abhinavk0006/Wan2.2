@@ -347,24 +347,25 @@ class WanI2V:
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
+        needs_unconditional = any(abs(float(scale) - 1.0) > 1e-6 for scale in guide_scale)
 
         # Use cached prompt embeddings when the persistent worker prepared them
         # before generation. This avoids restoring the large T5 model per clip.
         if encoded_context is not None or encoded_negative_context is not None:
-            if encoded_context is None or encoded_negative_context is None:
+            if encoded_context is None or (needs_unconditional and encoded_negative_context is None):
                 raise ValueError("Both encoded_context and encoded_negative_context are required")
             context = [t.to(self.device) for t in encoded_context]
-            context_null = [t.to(self.device) for t in encoded_negative_context]
+            context_null = [t.to(self.device) for t in (encoded_negative_context or [])]
         elif not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device) if needs_unconditional else []
             if offload_model:
                 self.text_encoder.model.cpu()
                 torch.cuda.empty_cache()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            context_null = self.text_encoder([n_prompt], torch.device('cpu')) if needs_unconditional else []
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
             if self.release_t5_after_encode:
