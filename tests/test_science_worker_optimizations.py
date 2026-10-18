@@ -2,6 +2,10 @@
 import importlib.util
 import types
 import unittest
+import tempfile
+import json
+import time
+from unittest import mock
 from pathlib import Path
 
 import torch
@@ -18,6 +22,30 @@ def load(name, path):
 
 
 class OptimizationTests(unittest.TestCase):
+    def test_stage_metrics_record_explicit_cumulative_memory_scope(self):
+        module = load("profile_worker_under_test", "quantization/kaggle_generate_video.py")
+        worker = module.WanVideoWorker.__new__(module.WanVideoWorker)
+        worker.args = types.SimpleNamespace(profile_stages=True)
+        worker._current_metrics = {"phases": []}
+        worker._phase_starts = {}
+        worker._request_started = time.perf_counter()
+        with mock.patch.object(torch.cuda, "device_count", return_value=0):
+            worker.profile_event("vae_decode", "start")
+            worker.profile_event("vae_decode", "end")
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "clip.mp4"
+                worker._finish_metrics(types.SimpleNamespace(output=output), "success")
+                data = json.loads(output.with_suffix(".metrics.json").read_text())
+                worker._current_metrics = {"phases": []}
+                worker._phase_starts = {"vae_decode": time.perf_counter()}
+                worker._finish_metrics(types.SimpleNamespace(output=output), "cuda_oom", "CUDA out of memory")
+                failed = json.loads(output.with_suffix(".metrics.json").read_text())
+                self.assertEqual(failed["incomplete_stages"], ["vae_decode"])
+                self.assertEqual(len(list(Path(directory).glob("clip.metrics.previous-*.json"))), 1)
+        self.assertEqual(data["phases"][0]["peak_scope"], "cumulative_since_request_start")
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["incomplete_stages"], [])
+
     def test_int8_direct_expansion_matches_float32_reference(self):
         cls = load("int8_under_test", "quantization/int8_linear.py").Int8Linear
         torch.manual_seed(42)

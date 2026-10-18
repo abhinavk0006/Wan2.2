@@ -141,6 +141,11 @@ class WanI2V:
         self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
         self.vae.device = device
 
+    def _profile_event(self, label, event):
+        worker = getattr(self, "_wan_worker", None)
+        if worker is not None:
+            worker.profile_event(label, event)
+
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
         """
@@ -351,6 +356,7 @@ class WanI2V:
 
         # Use cached prompt embeddings when the persistent worker prepared them
         # before generation. This avoids restoring the large T5 model per clip.
+        self._profile_event("text_context", "start")
         if encoded_context is not None or encoded_negative_context is not None:
             if encoded_context is None or (needs_unconditional and encoded_negative_context is None):
                 raise ValueError("Both encoded_context and encoded_negative_context are required")
@@ -372,6 +378,8 @@ class WanI2V:
                 self.text_encoder.model = None
                 gc.collect()
 
+        self._profile_event("text_context", "end")
+        self._profile_event("conditioning_encode_and_offload", "start")
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
@@ -386,6 +394,7 @@ class WanI2V:
             self._set_vae_device("cpu")
             gc.collect()
             torch.cuda.empty_cache()
+        self._profile_event("conditioning_encode_and_offload", "end")
 
         @contextmanager
         def noop_no_sync():
@@ -396,7 +405,9 @@ class WanI2V:
         no_sync_high_noise = getattr(self.high_noise_model, 'no_sync',
                                      noop_no_sync)
 
-        # evaluation mode
+        # Evaluation timing includes expert loading; expert_loads is a nested
+        # breakdown and must not be added to this stage a second time.
+        self._profile_event("denoise_including_expert_loads", "start")
         with (
                 torch.amp.autocast('cuda', dtype=self.param_dtype),
                 torch.no_grad(),
@@ -500,6 +511,8 @@ class WanI2V:
                 x0 = [latent]
                 del latent_model_input, timestep
 
+            self._profile_event("denoise_including_expert_loads", "end")
+            self._profile_event("decode_preparation", "start")
             if offload_model:
                 if self.low_noise_model is not None:
                     self.low_noise_model.cpu()
@@ -522,7 +535,10 @@ class WanI2V:
                 self._set_vae_device(self.device)
                 x0 = [latent.to(self.device)]
                 torch.cuda.empty_cache()
+            self._profile_event("decode_preparation", "end")
+            self._profile_event("vae_decode", "start")
             videos = self.vae.decode(x0)
+            self._profile_event("vae_decode", "end")
 
         del noise, latent, x0
         del sample_scheduler

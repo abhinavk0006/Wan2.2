@@ -115,6 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--expert-source-dir", type=Path,
         help="Optional mounted folder containing the original Comfy FP8 expert filenames; read directly without copying, downloading or deleting them.")
+    parser.add_argument("--profile-stages", action="store_true",
+        help="Synchronize stage boundaries and write per-request timing/CUDA memory metrics next to the output video.")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
         "--max-memory-gib",
@@ -274,12 +276,61 @@ class WanVideoWorker:
         self._t5_released_for_expert_swap = False
         self._prompt_context_cache: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
         self._prompt_text_cache: dict[str, tuple[str, str]] = {}
+        self._current_metrics = None
+        self._phase_starts = {}
+        model._wan_worker = self
         if args.lightning:
             logging.info("Lightning CFG=1: negative prompts do not affect denoising; encode positive constraints explicitly")
         if not args.model_dir:
             model._staged_expert_loading = True
-            model._wan_worker = self
             model._prepare_model_for_timestep = MethodType(WanVideoWorker._prepare_expert, model)
+
+    def _memory_snapshot(self):
+        result = []
+        for index in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(index)
+            result.append({"device": index, "name": torch.cuda.get_device_name(index),
+                "allocated_bytes": torch.cuda.memory_allocated(index),
+                "reserved_bytes": torch.cuda.memory_reserved(index),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(index),
+                "peak_reserved_bytes": torch.cuda.max_memory_reserved(index),
+                "free_bytes": free, "total_bytes": total})
+        return result
+
+    def profile_event(self, label, event):
+        if not self.args.profile_stages or self._current_metrics is None:
+            return
+        for index in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(index)
+        if event == "start":
+            self._phase_starts[label] = time.perf_counter()
+        else:
+            start = self._phase_starts.pop(label)
+            self._current_metrics["phases"].append({"stage": label,
+                "wall_seconds": time.perf_counter() - start,
+                "cuda": self._memory_snapshot(),
+                "peak_scope": "cumulative_since_request_start"})
+
+    def _finish_metrics(self, args, status, error=None):
+        if self._current_metrics is None:
+            return
+        metrics = self._current_metrics
+        metrics.update(status=status, error=error,
+            wall_seconds=time.perf_counter() - self._request_started,
+            incomplete_stages=list(self._phase_starts))
+        if self.args.profile_stages:
+            try:
+                metrics["cuda"] = self._memory_snapshot()
+            except Exception as snapshot_error:
+                metrics["memory_snapshot_error"] = str(snapshot_error)
+        try:
+            destination = args.output.with_suffix(".metrics.json")
+            if destination.exists():
+                destination.rename(destination.with_name(f"{args.output.stem}.metrics.previous-{time.time_ns()}.json"))
+            destination.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        except OSError:
+            logging.exception("Could not save request metrics")
+        self._current_metrics = None
 
     def _release_t5_for_expert_swap(self) -> None:
         """Free CPU T5 weights before converting the opposite DiT expert."""
@@ -390,6 +441,7 @@ class WanVideoWorker:
         other_name = "low_noise_model" if expert_name == "high_noise_model" else "high_noise_model"
         expert = getattr(self, expert_name)
         if expert is None:
+            expert_started = time.perf_counter()
             other = getattr(self, other_name)
             if other is not None:
                 worker._release_t5_for_expert_swap()
@@ -436,6 +488,10 @@ class WanVideoWorker:
                     adapter.unlink(missing_ok=True)
                 gc.collect()
             logging.info("Loaded %s on %s", expert_name, self.device)
+            if worker._current_metrics is not None:
+                worker._current_metrics["expert_loads"].append({"expert": expert_name,
+                    "wall_seconds": time.perf_counter() - expert_started,
+                    "includes": "source acquisition, LoRA merge, quantization and dispatch"})
         return getattr(self, expert_name)
 
     def cleanup(self):
@@ -461,6 +517,16 @@ class WanVideoWorker:
         if args.frames < 1 or (args.frames - 1) % 4:
             raise ValueError("Wan frame counts must be 4n+1, for example 17 or 49.")
         args.output.parent.mkdir(parents=True, exist_ok=True)
+        self._request_started = time.perf_counter()
+        self._phase_starts = {}
+        self._current_metrics = {"schema_version": 1, "frames": args.frames,
+            "max_area": args.max_area, "seed": args.seed, "steps": args.steps,
+            "sampling_mode": "lightning" if args.lightning else "base",
+            "profiling_synchronizes_cuda": args.profile_stages, "phases": [], "expert_loads": []}
+        if args.profile_stages:
+            for index in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(index)
+                torch.cuda.reset_peak_memory_stats(index)
         try:
             cache_key = str(task.get("prompt_cache_key", ""))
             cached_context = self._prompt_context_cache.get(cache_key)
@@ -483,7 +549,11 @@ class WanVideoWorker:
                     encoded_negative_context=cached_context[1] if cached_context else None)
             logging.info("Wan denoising completed in %.1fs", time.perf_counter() - generation_started)
         except torch.cuda.OutOfMemoryError as error:
+            self._finish_metrics(args, "cuda_oom", str(error))
             raise_cuda_oom(error)
+        except Exception as error:
+            self._finish_metrics(args, "error", str(error))
+            raise
         if args.memory_telemetry:
             log_cuda_memory("after-generation")
         from wan.utils.utils import save_video
@@ -494,6 +564,7 @@ class WanVideoWorker:
         del video
         if not args.output.is_file() or args.output.stat().st_size == 0:
             raise RuntimeError(f"Video writer did not produce a non-empty file at {args.output}")
+        self._finish_metrics(args, "success")
         return args.output
 
 
