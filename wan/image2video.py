@@ -262,7 +262,9 @@ class WanI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 encoded_context=None,
+                 encoded_negative_context=None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -346,8 +348,14 @@ class WanI2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        # preprocess
-        if not self.t5_cpu:
+        # Use cached prompt embeddings when the persistent worker prepared them
+        # before generation. This avoids restoring the large T5 model per clip.
+        if encoded_context is not None or encoded_negative_context is not None:
+            if encoded_context is None or encoded_negative_context is None:
+                raise ValueError("Both encoded_context and encoded_negative_context are required")
+            context = [t.to(self.device) for t in encoded_context]
+            context_null = [t.to(self.device) for t in encoded_negative_context]
+        elif not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
@@ -524,3 +532,4 @@ class WanI2V:
             dist.barrier()
 
         return videos[0]
+
