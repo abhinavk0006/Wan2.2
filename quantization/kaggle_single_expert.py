@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import fnmatch
 import json
 import logging
 import re
@@ -91,10 +92,13 @@ def _checkpoint_key_map(keys: list[str]) -> dict[str, str]:
     return result
 
 
-def _replace_linears_with_empty_int8(model: torch.nn.Module) -> None:
-    for parent in list(model.modules()):
+def _replace_linears_with_empty_int8(model: torch.nn.Module, keep_fp16=()) -> None:
+    for parent_name, parent in list(model.named_modules()):
         for name, child in list(parent.named_children()):
             if isinstance(child, torch.nn.Linear):
+                full_name = f"{parent_name}.{name}" if parent_name else name
+                if any(fnmatch.fnmatchcase(full_name, pattern) for pattern in keep_fp16):
+                    continue
                 replacement = Int8Linear(
                     child.in_features,
                     child.out_features,
@@ -126,6 +130,8 @@ def _dequantize_fp8_tensor(tensor: torch.Tensor, scale: torch.Tensor | None) -> 
 def load_fp8_scaled_wan_checkpoint(
     checkpoint_file: Path,
     lora_file: Path | None = None,
+    *, quantization: str = "per_tensor", keep_fp16=(), gpu_ids=None,
+    max_memory_gib=8.0, max_memory_gib_by_device=None, placement="balanced",
 ) -> tuple[torch.nn.Module, dict]:
     """Build a meta Wan I2V model and stream a Comfy FP8-scaled checkpoint into it.
 
@@ -218,15 +224,40 @@ def load_fp8_scaled_wan_checkpoint(
                 qk_norm=True,
                 cross_attn_norm=True,
                 eps=1e-6,
-            )
-        _replace_linears_with_empty_int8(model)
+            ).to(dtype=torch.float16)
+        if quantization not in {"per_tensor", "per_channel"}:
+            raise ValueError("quantization must be per_tensor or per_channel")
+        _replace_linears_with_empty_int8(model, keep_fp16)
+        if quantization == 'per_channel':
+            for module in model.modules():
+                if isinstance(module, Int8Linear):
+                    module.scale = torch.empty((module.out_features, 1), device='meta', dtype=torch.float32)
+        streamed_device_map = None
+        if gpu_ids:
+            _, streamed_device_map = dispatch_wan_model_across_gpus(model, gpu_ids,
+                max_memory_gib=max_memory_gib, max_memory_gib_by_device=max_memory_gib_by_device,
+                placement=placement, plan_only=True)
+        def tensor_device(module_name):
+            if streamed_device_map is None:
+                return 'cpu'
+            match = next((name for name in sorted(streamed_device_map, key=len, reverse=True)
+                if module_name == name or module_name.startswith(name+'.')), None)
+            if match is None:
+                raise ValueError(f'No streamed GPU placement for {module_name}')
+            return torch.device('cuda', streamed_device_map[match])
+        if keep_fp16:
+            matched = {pattern for pattern in keep_fp16 if any(
+                fnmatch.fnmatchcase(name, pattern) for name, module in model.named_modules()
+                if isinstance(module, torch.nn.Linear))}
+            if matched != set(keep_fp16):
+                raise ValueError(f"Unmatched FP16 layer patterns: {set(keep_fp16) - matched}")
 
         lora_plans = {}
         if adapter is not None:
             linear_dimensions = {
                 name: (module.in_features, module.out_features)
                 for name, module in model.named_modules()
-                if isinstance(module, Int8Linear) and name.startswith("blocks.")
+                if isinstance(module, (Int8Linear, torch.nn.Linear)) and name.startswith("blocks.")
             }
             adapter_keys = set(adapter.keys())
             adapter_shapes = {
@@ -246,7 +277,7 @@ def load_fp8_scaled_wan_checkpoint(
         quantization_started = time.perf_counter()
         int8_linear_count = count_int8_modules(model)
         for name, module in model.named_modules():
-            if isinstance(module, Int8Linear):
+            if isinstance(module, (Int8Linear, torch.nn.Linear)):
                 weight_name = f"{name}.weight"
                 if weight_name not in key_map:
                     raise ValueError(f"Checkpoint is missing {weight_name}")
@@ -275,15 +306,16 @@ def load_fp8_scaled_wan_checkpoint(
                         adapter.get_tensor(lora_plan.alpha_key),
                     )
                     lora_targets_merged += 1
-                maximum = weight.abs().max()
-                quant_scale = maximum / 127.0 if maximum.item() else torch.tensor(1.0)
-                quantized = torch.round(weight / quant_scale).clamp(-127, 127).to(torch.int8)
-                set_module_tensor_to_device(
-                    module, "weight_int8", "cpu", value=quantized
-                )
-                set_module_tensor_to_device(
-                    module, "scale", "cpu", value=quant_scale.float().reshape(())
-                )
+                quantized = None
+                if isinstance(module, Int8Linear):
+                    maximum = weight.abs().amax(dim=1, keepdim=True) if quantization == "per_channel" else weight.abs().max()
+                    quant_scale = torch.where(maximum > 0, maximum / 127.0, torch.ones_like(maximum))
+                    quantized = torch.round(weight / quant_scale).clamp(-127, 127).to(torch.int8)
+                    set_module_tensor_to_device(module, "weight_int8", tensor_device(name), value=quantized)
+                    # Per-channel scales broadcast over the input feature dimension.
+                    module.scale = quant_scale.float().to(tensor_device(name))
+                else:
+                    set_module_tensor_to_device(module, "weight", tensor_device(name), value=weight.to(torch.float16))
                 if source_weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                     fp8_scaled_weights += 1
                 if module.bias is not None:
@@ -291,7 +323,7 @@ def load_fp8_scaled_wan_checkpoint(
                     if bias_name not in key_map:
                         raise ValueError(f"Checkpoint is missing {bias_name}")
                     bias = handle.get_tensor(key_map[bias_name]).to(torch.float16)
-                    set_module_tensor_to_device(module, "bias", "cpu", value=bias)
+                    set_module_tensor_to_device(module, "bias", tensor_device(name), value=bias)
                 params_loaded += 1
                 del source_weight, weight, quantized, scale
                 continue
@@ -318,7 +350,7 @@ def load_fp8_scaled_wan_checkpoint(
                         f"{full_name} shape {tuple(value.shape)} does not match "
                         f"model shape {tuple(parameter.shape)}"
                     )
-                set_module_tensor_to_device(module, parameter_name, "cpu", value=value)
+                set_module_tensor_to_device(module, parameter_name, tensor_device(name), value=value)
                 if source.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                     fp8_scaled_weights += 1
                 params_loaded += 1
@@ -359,6 +391,14 @@ def load_fp8_scaled_wan_checkpoint(
         ),
         "model_storage_bytes_before": dense_fp16_bytes,
         "quantize_seconds": time.perf_counter() - quantization_started,
+        "quantization": quantization,
+        "keep_fp16": list(keep_fp16),
+        "streamed_device_map": streamed_device_map,
+        "model_config": dict(model_type="i2v", patch_size=patch_size, text_len=512,
+            in_dim=patch_shape[1], dim=dim, ffn_dim=ffn_shape[0], freq_dim=256,
+            text_dim=text_shape[1], out_dim=out_dim, num_heads=dim // 128,
+            num_layers=num_layers, window_size=(-1, -1), qk_norm=True,
+            cross_attn_norm=True, eps=1e-6),
     }
 
 
@@ -367,6 +407,9 @@ def dispatch_wan_model_across_gpus(
     gpu_ids: list[int],
     max_memory_gib: float = 8.0,
     max_memory_gib_by_device: dict[int, float] | None = None,
+    placement: str = "balanced",
+    plan_only: bool = False,
+    device_map_override: dict | None = None,
 ) -> tuple[torch.nn.Module, dict[str, object]]:
     """Place whole Wan transformer blocks across multiple CUDA devices.
 
@@ -410,8 +453,11 @@ def dispatch_wan_model_across_gpus(
             )
         else:
             units.append((name, child))
+    if placement not in {"balanced", "contiguous"}:
+        raise ValueError("placement must be balanced or contiguous")
     loads = {device_id: 0 for device_id in gpu_ids}
     device_map = {}
+    current_device_position = 0
     for name, child in units:
         size = sum(
             tensor.numel() * tensor.element_size()
@@ -424,11 +470,17 @@ def dispatch_wan_model_across_gpus(
                 loads[device_id],
             ),
         )
+        if placement == "contiguous":
+            candidates = gpu_ids[current_device_position:]
         selected = next(
             (device_id for device_id in candidates
              if loads[device_id] + size <= budgets[device_id]),
             None,
         )
+        if device_map_override is not None:
+            selected = device_map_override.get(name)
+            if selected not in loads or loads[selected] + size > budgets[selected]:
+                raise ValueError(f'Precomputed placement exceeds budget or misses module {name}')
         if selected is None:
             raise RuntimeError(
                 "Wan model does not fit within the requested per-GPU memory "
@@ -436,6 +488,8 @@ def dispatch_wan_model_across_gpus(
                 f"module_bytes={size}, loads={loads}, budgets={budgets}"
             )
         device_map[name] = selected
+        if placement == "contiguous":
+            current_device_position = gpu_ids.index(selected)
         loads[selected] += size
 
     assigned_devices = set(device_map.values())
@@ -446,7 +500,9 @@ def dispatch_wan_model_across_gpus(
             f"without CPU/disk offload: {device_map}"
         )
 
-    logging.info("Dispatching Wan modules over CUDA devices: %s (bytes=%s)", device_map, loads)
+    logging.info("%s Wan modules over CUDA devices: %s (bytes=%s)", 'Planning' if plan_only else 'Dispatching', device_map, loads)
+    if plan_only:
+        return model, device_map
     model = dispatch_model(model, device_map=device_map, main_device=gpu_ids[0])
     return model, {str(module): device for module, device in device_map.items()}
 

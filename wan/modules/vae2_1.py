@@ -541,7 +541,7 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return mu
 
-    def decode(self, z, scale):
+    def decode(self, z, scale, *, output_device=None):
         self.clear_cache()
         # z: [b,c,t,h,w]
         if isinstance(scale[0], torch.Tensor):
@@ -551,21 +551,21 @@ class WanVAE_(nn.Module):
             z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
-        for i in range(iter_):
-            self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
+        chunks = []
+        try:
+            for i in range(iter_):
+                self._conv_idx = [0]
+                chunk = self.decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx)
-            else:
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
-        self.clear_cache()
-        return out
+                # Preserve causal feature caches on the decoder device, while
+                # completed frames can leave GPU memory immediately.
+                chunks.append(chunk.to(output_device) if output_device else chunk)
+                del chunk
+            return torch.cat(chunks, 2)
+        finally:
+            self.clear_cache()
 
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
@@ -657,7 +657,8 @@ class Wan2_1_VAE:
     def decode(self, zs):
         with amp.autocast(dtype=self.dtype):
             return [
-                self.model.decode(u.unsqueeze(0),
-                                  self.scale).float().clamp_(-1, 1).squeeze(0)
+                self.model.decode(u.unsqueeze(0), self.scale,
+                    output_device='cpu' if getattr(self, 'stream_to_cpu', False) else None
+                    ).float().clamp_(-1, 1).squeeze(0)
                 for u in zs
             ]

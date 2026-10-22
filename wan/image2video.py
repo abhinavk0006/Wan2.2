@@ -523,6 +523,13 @@ class WanI2V:
                 # Staged Kaggle inference keeps only the active DiT expert on
                 # the GPUs during denoising. Release it before VAE decoding,
                 # which needs a large contiguous activation workspace.
+                worker = getattr(self, '_wan_worker', None)
+                if worker is not None:
+                    for expert_name in ('high_noise_model', 'low_noise_model'):
+                        active = getattr(self, expert_name)
+                        if active is not None:
+                            worker._retain_expert(expert_name, active)
+                        del active
                 self.low_noise_model = None
                 self.high_noise_model = None
                 del model
